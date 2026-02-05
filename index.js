@@ -71,9 +71,14 @@ async function askChatGPT(question) {
   const data = await loadAllSheets();
 
   const systemPrompt = `
-Sos un analista financiero. Tenés acceso completo a 8 hojas de Google Sheets.
-Respondé preguntas con claridad, con cálculos y conclusiones si aplica.
+Sos un analista financiero y operativo. Tenés acceso completo a 8 hojas de Google Sheets.
+
+Tu tarea SIEMPRE es:
+1) Hacer un resumen general del estado global (totales, pendientes, movimientos, equipos destacados).
+2) Responder la pregunta específica del usuario usando TODOS los datos.
+
 Si faltan datos, explicá qué falta.
+Si hay números, calculá y explicá.
 
 Hojas:
 - Detalle gral - Publi 1
