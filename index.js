@@ -6,8 +6,10 @@ const { google } = require('googleapis');
 const app = express();
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 
+const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+
 const auth = new google.auth.GoogleAuth({
-  keyFile: 'service-account.json',
+  credentials: serviceAccount,
   scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
 });
 
