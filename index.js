@@ -194,6 +194,33 @@ async function getNextResumenRow(dateStr) {
   return 2;
 }
 
+async function getPendingFromPreviousDay(dateStr) {
+  const dates = await getSheetValues(RESUMEN_SHEET, 'A:A');
+  const pendings = await getSheetValues(RESUMEN_SHEET, 'AD:AD');
+  const target = normalizeDateInput(dateStr);
+
+  let targetRow = -1;
+  for (let i = 1; i < dates.length; i += 1) {
+    const cellValue = dates[i]?.[0] ?? '';
+    if (normalizeDateInput(cellValue) === target) {
+      targetRow = i;
+      break;
+    }
+  }
+
+  if (targetRow > 1) {
+    const prev = pendings[targetRow - 1]?.[0];
+    return parseNumber(prev) ?? 0;
+  }
+
+  for (let i = pendings.length - 1; i >= 1; i -= 1) {
+    const val = parseNumber(pendings[i]?.[0]);
+    if (val !== null) return val;
+  }
+
+  return 0;
+}
+
 function buildResumenValues(summary) {
   const values = [];
   const push = (val) => values.push(val ?? '');
@@ -224,6 +251,7 @@ function buildResumenValues(summary) {
 function summarizeCierre(summary) {
   const lines = [];
   lines.push(`📅 Fecha: ${summary.fecha}`);
+  lines.push(`📌 Pendiente anterior: ${summary.pendienteAnterior}`);
   TEAM_ORDER.forEach((team) => {
     const t = summary.teams[team.key];
     lines.push(
@@ -284,7 +312,7 @@ async function handleCierreFlow(chatId, text) {
     bot.sendMessage(
       chatId,
       sanitizeTelegramText(
-        `🎯 ${team.label}: enviame Venta, Depósitos y Retiros. Ej: 1000000, 5000000, 2000000`
+        `🎯 ${team.label}: enviame Venta, Depósitos y Retiros. La venta debe ser Depósitos - Retiros. Ej: 1000000, 5000000, 4000000`
       )
     );
     return true;
@@ -300,8 +328,19 @@ async function handleCierreFlow(chatId, text) {
       return true;
     }
     const [venta, depositos, retiros] = numbers;
+    const expectedVenta = Math.round(depositos - retiros);
+    if (Math.round(venta) !== expectedVenta) {
+      bot.sendMessage(
+        chatId,
+        sanitizeTelegramText(
+          `⚠️ La venta no coincide. Depósitos - Retiros = ${expectedVenta}. Enviá de nuevo: venta, depósitos, retiros.`
+        )
+      );
+      return true;
+    }
+
     const comision = Math.round(depositos * 0.015);
-    const neto = Math.round(venta + depositos - retiros - comision);
+    const neto = Math.round(venta - comision);
 
     const team = TEAM_ORDER[session.teamIndex];
     session.teams[team.key] = { venta, depositos, retiros, comision, neto };
@@ -312,7 +351,7 @@ async function handleCierreFlow(chatId, text) {
       bot.sendMessage(
         chatId,
         sanitizeTelegramText(
-          `🎯 ${next.label}: enviame Venta, Depósitos y Retiros. Ej: 1000000, 5000000, 2000000`
+          `🎯 ${next.label}: enviame Venta, Depósitos y Retiros. La venta debe ser Depósitos - Retiros.`
         )
       );
       return true;
@@ -358,7 +397,8 @@ async function handleCierreFlow(chatId, text) {
     session.observaciones = text.trim() || 'sin obs';
 
     const totalNeto = TEAM_ORDER.reduce((sum, team) => sum + session.teams[team.key].neto, 0);
-    const totalABajar = totalNeto;
+    const pendienteAnterior = await getPendingFromPreviousDay(session.fecha);
+    const totalABajar = Math.round(totalNeto + pendienteAnterior);
     const pendienteABajar = Math.round(totalABajar - session.bajadoReal);
     const prestamosPendientes = Math.round(session.prestamosPedidos - session.prestamosDevueltos);
 
@@ -398,6 +438,7 @@ async function handleCierreFlow(chatId, text) {
       prestamosPendientes,
       observaciones: session.observaciones,
       alertas,
+      pendienteAnterior,
     };
 
     const rowIndex = await getNextResumenRow(summary.fecha);
