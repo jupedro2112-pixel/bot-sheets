@@ -2,11 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { google } = require('googleapis');
+const OpenAI = require('openai');
 
 const app = express();
 app.use(express.json());
 
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
 const auth = new google.auth.GoogleAuth({
@@ -45,6 +47,11 @@ const RESUMEN_COLUMNS = [
   'MARSHALL_RETIROS',
   'MARSHALL_COMISION',
   'MARSHALL_NETO',
+  'ATOMIC_VENTA',
+  'ATOMIC_DEPOSITOS',
+  'ATOMIC_RETIROS',
+  'ATOMIC_COMISION',
+  'ATOMIC_NETO',
   'TOTAL_NETO',
   'TOTAL_A_BAJAR',
   'BAJADO_REAL',
@@ -52,6 +59,7 @@ const RESUMEN_COLUMNS = [
   'PRESTAMOS_PEDIDOS',
   'PRESTAMOS_DEVUELTOS',
   'PRESTAMOS_PENDIENTES',
+  'GASTOS',
   'OBSERVACIONES',
 ];
 
@@ -61,9 +69,14 @@ const TEAM_ORDER = [
   { key: 'IGNITE_TRIBET', label: 'IGNITE/TRIBET' },
   { key: 'TIGER', label: 'TIGER' },
   { key: 'MARSHALL', label: 'MARSHALL' },
+  { key: 'ATOMIC', label: 'ATOMIC' },
 ];
 
 const cierreSessions = new Map();
+
+// Batch 5 segundos
+const BATCH_WINDOW_MS = 5000;
+const batchQueue = new Map();
 
 function sanitizeTelegramText(text) {
   return text.replace(/[*#]/g, '');
@@ -90,6 +103,16 @@ function parseTwoNumbers(text) {
   const nums = (text.match(/-?\d[\d.,]*/g) || []).map(parseNumber).filter((n) => n !== null);
   if (nums.length < 2) return null;
   return nums.slice(0, 2);
+}
+
+function safeJsonExtract(text) {
+  const match = text.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
 }
 
 function normalizeDateValue(value) {
@@ -196,7 +219,7 @@ async function getNextResumenRow(dateStr) {
 
 async function getPendingFromPreviousDay(dateStr) {
   const dates = await getSheetValues(RESUMEN_SHEET, 'A:A');
-  const pendings = await getSheetValues(RESUMEN_SHEET, 'AD:AD');
+  const pendings = await getSheetValues(RESUMEN_SHEET, 'AI:AI');
   const target = normalizeDateInput(dateStr);
 
   let targetRow = -1;
@@ -221,6 +244,79 @@ async function getPendingFromPreviousDay(dateStr) {
   return 0;
 }
 
+async function analyzeImages(imageUrls, caption = '') {
+  if (!imageUrls.length) return null;
+
+  const systemPrompt = `
+Sos un extractor de datos financieros de imágenes.
+Para cada imagen, identificá si es:
+1) Panel de casino: devuelve depositos, retiros y venta (si aparece).
+2) Comprobante de bajado: devuelve monto transferido.
+
+Devolvé SOLO JSON en este formato:
+{"items":[{"type":"panel","depositos":0,"retiros":0,"venta":0},{"type":"bajado","monto":0}]}
+
+Si un dato no está, usá null.
+`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0,
+    max_tokens: 500,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: `Contexto: ${caption || 'sin texto'}` },
+          ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
+        ],
+      },
+    ],
+  });
+
+  const raw = response.choices[0].message.content || '';
+  const parsed = safeJsonExtract(raw);
+  const items = parsed?.items || (Array.isArray(parsed) ? parsed : null);
+  if (!Array.isArray(items)) return null;
+
+  let panelDeposit = 0;
+  let panelRetiros = 0;
+  let panelVenta = 0;
+  let panelCount = 0;
+  let hasVenta = false;
+  let bajadoTotal = 0;
+
+  items.forEach((item) => {
+    if (item.type === 'panel') {
+      const dep = parseNumber(item.depositos);
+      const ret = parseNumber(item.retiros);
+      const ven = parseNumber(item.venta);
+      if (dep !== null) panelDeposit += dep;
+      if (ret !== null) panelRetiros += ret;
+      if (ven !== null) {
+        panelVenta += ven;
+        hasVenta = true;
+      }
+      panelCount += 1;
+    } else if (item.type === 'bajado') {
+      const monto = parseNumber(item.monto);
+      if (monto !== null) bajadoTotal += monto;
+    }
+  });
+
+  let panelData = null;
+  if (panelCount > 0) {
+    const ventaFinal = hasVenta ? panelVenta : panelDeposit - panelRetiros;
+    panelData = { venta: ventaFinal, depositos: panelDeposit, retiros: panelRetiros };
+  }
+
+  return {
+    panel: panelData,
+    bajadoTotal: bajadoTotal > 0 ? bajadoTotal : null,
+  };
+}
+
 function buildResumenValues(summary) {
   const values = [];
   const push = (val) => values.push(val ?? '');
@@ -243,6 +339,7 @@ function buildResumenValues(summary) {
   push(summary.prestamosPedidos);
   push(summary.prestamosDevueltos);
   push(summary.prestamosPendientes);
+  push(summary.gastos);
   push(summary.observaciones);
 
   return values;
@@ -258,6 +355,7 @@ function summarizeCierre(summary) {
       `🎯 ${team.label}: Venta ${t.venta} | Depósitos ${t.depositos} | Retiros ${t.retiros} | Comisión ${t.comision} | Neto ${t.neto}`
     );
   });
+  lines.push(`💸 Gastos: ${summary.gastos}`);
   lines.push(`💰 Total Neto: ${summary.totalNeto}`);
   lines.push(`🏦 Total a Bajar: ${summary.totalABajar}`);
   lines.push(`✅ Bajado Real: ${summary.bajadoReal}`);
@@ -282,6 +380,7 @@ function startCierre(chatId) {
     prestamosPedidos: 0,
     prestamosDevueltos: 0,
     bajadoReal: 0,
+    gastos: 0,
     observaciones: '',
   });
   bot.sendMessage(
@@ -312,7 +411,7 @@ async function handleCierreFlow(chatId, text) {
     bot.sendMessage(
       chatId,
       sanitizeTelegramText(
-        `🎯 ${team.label}: enviame Venta, Depósitos y Retiros. La venta debe ser Depósitos - Retiros. Ej: 1000000, 5000000, 4000000`
+        `🎯 ${team.label}: enviame Venta, Depósitos y Retiros (o foto del panel). La venta debe ser Depósitos - Retiros.`
       )
     );
     return true;
@@ -351,7 +450,7 @@ async function handleCierreFlow(chatId, text) {
       bot.sendMessage(
         chatId,
         sanitizeTelegramText(
-          `🎯 ${next.label}: enviame Venta, Depósitos y Retiros. La venta debe ser Depósitos - Retiros.`
+          `🎯 ${next.label}: enviame Venta, Depósitos y Retiros (o foto del panel). La venta debe ser Depósitos - Retiros.`
         )
       );
       return true;
@@ -376,8 +475,20 @@ async function handleCierreFlow(chatId, text) {
     }
     session.prestamosPedidos = numbers[0];
     session.prestamosDevueltos = numbers[1];
+    session.step = 'gastos';
+    bot.sendMessage(chatId, sanitizeTelegramText('💸 Gastos del día (sin devolución).'));
+    return true;
+  }
+
+  if (session.step === 'gastos') {
+    const gastos = parseNumber(text);
+    if (gastos === null) {
+      bot.sendMessage(chatId, sanitizeTelegramText('⚠️ Enviá un número válido para gastos.'));
+      return true;
+    }
+    session.gastos = gastos;
     session.step = 'bajado';
-    bot.sendMessage(chatId, sanitizeTelegramText('🏦 ¿Cuánto se bajó real hoy?'));
+    bot.sendMessage(chatId, sanitizeTelegramText('🏦 ¿Cuánto se bajó real hoy? Podés mandar comprobantes.'));
     return true;
   }
 
@@ -396,7 +507,8 @@ async function handleCierreFlow(chatId, text) {
   if (session.step === 'observaciones') {
     session.observaciones = text.trim() || 'sin obs';
 
-    const totalNeto = TEAM_ORDER.reduce((sum, team) => sum + session.teams[team.key].neto, 0);
+    const totalNetoRaw = TEAM_ORDER.reduce((sum, team) => sum + session.teams[team.key].neto, 0);
+    const totalNeto = Math.round(totalNetoRaw - session.gastos);
     const pendienteAnterior = await getPendingFromPreviousDay(session.fecha);
     const totalABajar = Math.round(totalNeto + pendienteAnterior);
     const pendienteABajar = Math.round(totalABajar - session.bajadoReal);
@@ -436,6 +548,7 @@ async function handleCierreFlow(chatId, text) {
       prestamosPedidos: session.prestamosPedidos,
       prestamosDevueltos: session.prestamosDevueltos,
       prestamosPendientes,
+      gastos: session.gastos,
       observaciones: session.observaciones,
       alertas,
       pendienteAnterior,
@@ -458,34 +571,86 @@ async function handleCierreFlow(chatId, text) {
   return false;
 }
 
+function enqueueBatch(chatId, item) {
+  if (!batchQueue.has(chatId)) {
+    batchQueue.set(chatId, { texts: [], images: [], timer: null });
+  }
+  const batch = batchQueue.get(chatId);
+  if (item.text) batch.texts.push(item.text);
+  if (item.imageUrl) batch.images.push(item.imageUrl);
+
+  if (batch.timer) clearTimeout(batch.timer);
+  batch.timer = setTimeout(() => processBatch(chatId), BATCH_WINDOW_MS);
+}
+
+async function processBatch(chatId) {
+  const batch = batchQueue.get(chatId);
+  if (!batch) return;
+
+  batchQueue.delete(chatId);
+
+  const combinedText = batch.texts.join('\n').trim();
+  const imageUrls = batch.images;
+
+  if (/hacer cierre/i.test(combinedText) && !cierreSessions.has(chatId)) {
+    startCierre(chatId);
+  }
+
+  let text = combinedText.replace(/hacer cierre/i, '').trim();
+  const session = cierreSessions.get(chatId);
+
+  let imageData = null;
+  if (imageUrls.length) {
+    imageData = await analyzeImages(imageUrls, text);
+  }
+
+  if (session) {
+    if (!text) {
+      if (session.step === 'equipo' && imageData?.panel) {
+        text = `${imageData.panel.venta}, ${imageData.panel.depositos}, ${imageData.panel.retiros}`;
+      }
+      if (session.step === 'bajado' && imageData?.bajadoTotal !== null) {
+        text = `${imageData.bajadoTotal}`;
+      }
+    }
+    const handled = await handleCierreFlow(chatId, text || '');
+    if (handled) return;
+  }
+
+  if (!session && combinedText) {
+    bot.sendMessage(
+      chatId,
+      sanitizeTelegramText('Usá "hacer cierre" para iniciar el cierre diario paso a paso.')
+    );
+  }
+}
+
 // Responde a cualquier mensaje de texto (sin comandos)
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
-
   if (!text || text.startsWith('/')) return;
-
-  if (/hacer cierre/i.test(text)) {
-    startCierre(chatId);
-    return;
-  }
-
-  const cierreHandled = await handleCierreFlow(chatId, text);
-  if (cierreHandled) return;
-
-  bot.sendMessage(
-    chatId,
-    sanitizeTelegramText('Usá "hacer cierre" para iniciar el cierre diario paso a paso.')
-  );
+  enqueueBatch(chatId, { text });
 });
 
-// Recibe fotos (no se usan para cierre)
+// Recibe fotos y las interpreta
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
-  bot.sendMessage(
-    chatId,
-    sanitizeTelegramText('Solo se procesan cierres por texto. Usá "hacer cierre".')
-  );
+  const caption = (msg.caption || '').trim();
+
+  try {
+    const photos = msg.photo || [];
+    if (!photos.length) return;
+
+    const fileId = photos[photos.length - 1].file_id;
+    const file = await bot.getFile(fileId);
+    const imageUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_TOKEN}/${file.file_path}`;
+
+    enqueueBatch(chatId, { text: caption, imageUrl });
+  } catch (err) {
+    console.error(err);
+    bot.sendMessage(chatId, 'Error al recibir la imagen. Revisá logs.');
+  }
 });
 
 /* ================= WEBHOOK ================= */
