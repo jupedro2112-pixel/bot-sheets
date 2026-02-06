@@ -33,8 +33,21 @@ const SHEETS_CONFIG = [
 const chatMemory = new Map();
 const MAX_HISTORY = 12; // 12 mensajes (6 user + 6 assistant)
 
-// Límite de tokens aproximado antes de llamar a OpenAI
-const MAX_APPROX_TOKENS = 6000;
+// Precios GPT-4o-mini (USD por 1M tokens)
+const PRICE_INPUT_PER_1M = 0.15;
+const PRICE_OUTPUT_PER_1M = 0.60;
+
+// Límite de costo por mensaje (USD)
+const MAX_COST_USD = 0.5;
+
+// Máximo de tokens de salida para controlar gasto
+const MAX_OUTPUT_TOKENS = 800;
+
+// Cálculo de tokens máximos de entrada según presupuesto
+const MAX_INPUT_TOKENS = Math.floor(
+  (MAX_COST_USD - (MAX_OUTPUT_TOKENS * PRICE_OUTPUT_PER_1M) / 1_000_000) /
+    (PRICE_INPUT_PER_1M / 1_000_000)
+);
 
 async function getSheetValues(sheetName, range) {
   const client = await auth.getClient();
@@ -91,13 +104,17 @@ function pushHistory(chatId, role, content) {
   }
 }
 
+function sanitizeTelegramText(text) {
+  return text.replace(/[*#]/g, '');
+}
+
 async function askChatGPT(chatId, question) {
   const data = await loadAllSheets();
 
   const payload = JSON.stringify(data);
   const approxTokens = Math.ceil(payload.length / 4);
 
-  if (approxTokens > MAX_APPROX_TOKENS) {
+  if (approxTokens > MAX_INPUT_TOKENS) {
     return `⚠️ Datos muy grandes (${payload.length} chars ~ ${approxTokens} tokens). No consulté a OpenAI.`;
   }
 
@@ -109,6 +126,11 @@ Tu tarea SIEMPRE es:
 2) Responder la pregunta específica del usuario usando TODOS los datos.
 
 Además, tenés memoria de la conversación y debés mantener contexto.
+
+Estilo:
+- No uses * ni #.
+- No uses markdown.
+- Usá emojis para separar ideas y dar claridad.
 
 Si faltan datos, explicá qué falta.
 Si hay números, calculá y explicá.
@@ -129,6 +151,7 @@ Hojas:
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     temperature: 0.2,
+    max_tokens: MAX_OUTPUT_TOKENS,
     messages: [
       { role: 'system', content: systemPrompt },
       ...history,
@@ -136,7 +159,7 @@ Hojas:
     ],
   });
 
-  return response.choices[0].message.content;
+  return sanitizeTelegramText(response.choices[0].message.content || '');
 }
 
 // Responde a cualquier mensaje de texto (sin comandos)
