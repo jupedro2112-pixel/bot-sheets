@@ -25,7 +25,7 @@ const auth = new google.auth.GoogleAuth({
 const SHEET_ID = process.env.SHEET_ID;
 
 const SHEETS_CONFIG = [
-  { name: 'Detalle gral - Publi 1', headerRow: 2, range: 'A:Z' },
+  { name: 'Detalle gral - Publi 1', headerRow: 2, range: 'A:AB' },
   { name: 'MOVIMIENTOS', headerRow: 1, range: 'A:Z' },
   { name: 'ARGENTUM', headerRow: 4, range: 'A:Z' },
   { name: 'ROYAL JYG', headerRow: 4, range: 'A:Z' },
@@ -74,28 +74,23 @@ function rowsToObjects(values, headerRowIndex) {
 
 async function loadAllSheets() {
   const allData = {};
+  const rawData = {};
   for (const sheet of SHEETS_CONFIG) {
     const values = await getSheetValues(sheet.name, sheet.range);
+    rawData[sheet.name] = values;
     allData[sheet.name] = rowsToObjects(values, sheet.headerRow);
   }
-  return allData;
+  return { allData, rawData };
 }
 
 function parseNumber(value) {
-  if (value == null) return 0;
+  if (value == null || value === '') return 0;
   const cleaned = String(value)
     .replace(/\./g, '')
     .replace(',', '.')
     .replace(/[^\d.-]/g, '');
   const num = Number(cleaned);
   return Number.isFinite(num) ? num : 0;
-}
-
-function findFirstValue(row, possibleKeys) {
-  for (const key of possibleKeys) {
-    if (row[key] != null && row[key] !== '') return row[key];
-  }
-  return null;
 }
 
 function extractDayOfMonth(text) {
@@ -105,94 +100,104 @@ function extractDayOfMonth(text) {
 
 function parseDateToDay(value) {
   if (!value) return null;
+
+  // Formato dd/mm/yyyy
+  const str = String(value).trim();
+  const match = str.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})$/);
+  if (match) {
+    const day = Number(match[1]);
+    return Number.isFinite(day) ? day : null;
+  }
+
+  // Fallback si Google devuelve fecha serial o ISO
   const d = new Date(value);
   if (!Number.isNaN(d.getTime())) return d.getDate();
+
   return null;
 }
 
-/* ================= FINANCIAL ENGINE ================= */
+/* ================= FINANCIAL ENGINE (DETALLE GRAL) ================= */
 
-function buildFinancialSummary(data, question) {
-  const summary = {
-    fecha: new Date().toISOString().slice(0, 10),
-    resumen_global: {
-      total_ingresos: 0,
-      total_egresos: 0,
-      resultado: 0,
-    },
-    por_equipo: {},
-    alertas: [],
-  };
+function buildFinancialSummaryFromDetalle(rawDetalle, question) {
+  if (!rawDetalle || rawDetalle.length < 3) {
+    return { error: 'No hay datos en Detalle gral - Publi 1.' };
+  }
 
   const dayRequested = extractDayOfMonth(question);
 
-  const MONTO_KEYS = ['monto', 'Monto', 'IMPORTE', 'Importe', 'Total', 'total'];
-  const TIPO_KEYS = ['tipo', 'Tipo', 'MOVIMIENTO', 'Movimiento'];
-  const FECHA_KEYS = ['fecha', 'Fecha', 'Día', 'Dia'];
+  // Datos diarios comienzan en fila 3 => index 2
+  const dataRows = rawDetalle.slice(2);
+  const rowsWithDate = dataRows.filter(r => r[0]);
 
-  for (const [sheet, rows] of Object.entries(data)) {
-    let ingresos = 0;
-    let egresos = 0;
-    let movimientos = 0;
+  let filtered = rowsWithDate;
 
-    rows.forEach(r => {
-      if (dayRequested) {
-        const fechaVal = findFirstValue(r, FECHA_KEYS);
-        const day = parseDateToDay(fechaVal);
-        if (day != null && day !== dayRequested) return;
-      }
-
-      const montoVal = findFirstValue(r, MONTO_KEYS);
-      const tipoVal = findFirstValue(r, TIPO_KEYS);
-
-      const monto = parseNumber(montoVal);
-      const tipo = String(tipoVal || '').toLowerCase();
-
-      if (monto || tipo) movimientos++;
-
-      if (tipo.includes('ingreso')) ingresos += monto;
-      if (tipo.includes('egreso') || tipo.includes('retiro') || tipo.includes('baja')) egresos += monto;
+  if (dayRequested) {
+    filtered = rowsWithDate.filter(r => {
+      const day = parseDateToDay(r[0]) || parseNumber(String(r[0]).replace(/[^\d]/g, ''));
+      return day === dayRequested;
     });
-
-    summary.por_equipo[sheet] = {
-      ingresos,
-      egresos,
-      pendiente: ingresos - egresos,
-      movimientos,
-    };
-
-    summary.resumen_global.total_ingresos += ingresos;
-    summary.resumen_global.total_egresos += egresos;
   }
 
-  summary.resumen_global.resultado =
-    summary.resumen_global.total_ingresos -
-    summary.resumen_global.total_egresos;
+  const targetRow = filtered[filtered.length - 1];
 
-  return summary;
+  if (!targetRow) {
+    return {
+      error: dayRequested
+        ? `No encontré datos para el día ${dayRequested}.`
+        : 'No encontré una fila con fecha válida.',
+    };
+  }
+
+  // Columnas exactas según tu documentación:
+  // A=0, B=1, C=2, D=3, E=4, F=5, G=6, H=7, L=11, O=14, P=15, Q=16, R=17, S=18
+  const fecha = targetRow[0];
+  const totalA_Bajar = parseNumber(targetRow[7]);
+  const bajadas = parseNumber(targetRow[11]);
+  const ingresos = parseNumber(targetRow[14]);
+  const egresos = parseNumber(targetRow[15]);
+  const perdidas = parseNumber(targetRow[16]);
+  const gastos = parseNumber(targetRow[17]);
+  const diferencia = parseNumber(targetRow[18]);
+
+  const porMarca = {
+    ARGENTUM: parseNumber(targetRow[2]),
+    'ROYAL JYG': parseNumber(targetRow[3]),
+    'TRIBET BUFFA': parseNumber(targetRow[4]),
+    TIGER: parseNumber(targetRow[5]),
+    MARSHALL: parseNumber(targetRow[6]),
+  };
+
+  let faltante_bajar = 0;
+  let sobrante = 0;
+
+  if (diferencia < 0) faltante_bajar = Math.abs(diferencia);
+  if (diferencia > 0) sobrante = diferencia;
+
+  return {
+    fecha,
+    resumen_global: {
+      total_a_bajar: totalA_Bajar,
+      bajadas,
+      ingresos,
+      egresos,
+      perdidas,
+      gastos,
+      diferencia,
+      faltante_bajar,
+      sobrante,
+    },
+    por_marca: porMarca,
+  };
 }
 
 function detectChanges(prev, curr) {
-  if (!prev) return [];
+  if (!prev || prev.error || curr.error) return [];
   const alerts = [];
 
-  if (prev.resumen_global.resultado !== curr.resumen_global.resultado) {
+  if (prev.resumen_global.diferencia !== curr.resumen_global.diferencia) {
     alerts.push(
-      `Resultado global cambió de ${prev.resumen_global.resultado} a ${curr.resumen_global.resultado}`
+      `Diferencia cambió de ${prev.resumen_global.diferencia} a ${curr.resumen_global.diferencia}`
     );
-  }
-
-  for (const team of Object.keys(curr.por_equipo)) {
-    if (!prev.por_equipo[team]) continue;
-    const p = prev.por_equipo[team];
-    const c = curr.por_equipo[team];
-
-    if (p.pendiente !== c.pendiente) {
-      alerts.push(`${team}: pendiente ${p.pendiente} → ${c.pendiente}`);
-    }
-    if (p.movimientos !== c.movimientos) {
-      alerts.push(`${team}: movimientos ${p.movimientos} → ${c.movimientos}`);
-    }
   }
 
   return alerts;
@@ -201,8 +206,9 @@ function detectChanges(prev, curr) {
 /* ================= CACHE REFRESH ================= */
 
 async function refreshCache(questionForContext = '') {
-  const data = await loadAllSheets();
-  const summary = buildFinancialSummary(data, questionForContext);
+  const { rawData } = await loadAllSheets();
+  const detalle = rawData['Detalle gral - Publi 1'];
+  const summary = buildFinancialSummaryFromDetalle(detalle, questionForContext);
   summary.alertas = detectChanges(cachedSummary, summary);
   cachedSummary = summary;
   cachedAt = Date.now();
@@ -232,9 +238,9 @@ async function askChatGPT(chatId, question) {
   const systemPrompt = `
 Sos un analista financiero profesional.
 Tu tarea es:
-1) Analizar el estado financiero global.
-2) Detectar cambios, riesgos y oportunidades.
-3) Responder con deducción lógica, precisión numérica y claridad.
+1) Analizar el cierre diario del casino.
+2) Detectar faltantes, sobrantes y riesgos.
+3) Responder con precisión numérica y claridad.
 `;
 
   const history = getChatHistory(chatId);
@@ -282,7 +288,6 @@ app.post(WEBHOOK_PATH, (req, res) => {
 
 const REFRESH_SECRET = process.env.REFRESH_SECRET;
 
-// Endpoint que llamará Apps Script
 app.post('/sheets-refresh', async (req, res) => {
   try {
     if (!REFRESH_SECRET || req.get('x-refresh-secret') !== REFRESH_SECRET) {
