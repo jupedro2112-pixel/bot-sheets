@@ -200,6 +200,16 @@ function normalizeDateInput(value) {
   return normalized;
 }
 
+function extractDateFromText(text) {
+  const iso = text.match(/\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b/);
+  if (iso) return normalizeDateInput(iso[0]);
+
+  const dmy = text.match(/\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b/);
+  if (dmy) return normalizeDateInput(dmy[0]);
+
+  return '';
+}
+
 async function findRowByDate(sheetName, dateStr) {
   const config = getSheetConfig(sheetName);
   if (!config) return null;
@@ -212,6 +222,32 @@ async function findRowByDate(sheetName, dateStr) {
     const normalized = normalizeDateInput(cellValue);
     if (normalized && normalized === target) {
       return i + 1;
+    }
+  }
+  return null;
+}
+
+async function getDetalleRowByDate(dateStr) {
+  const sheetName = 'Detalle gral - Publi 1';
+  const config = getSheetConfig(sheetName);
+  if (!config) return null;
+
+  const values = await getSheetValues(sheetName, 'A:Z');
+  if (!values.length || values.length < config.headerRow) return null;
+
+  const headers = values[config.headerRow - 1].map((h) => (h || '').trim());
+  const target = normalizeDateInput(dateStr);
+
+  for (let i = config.headerRow; i < values.length; i += 1) {
+    const row = values[i] || [];
+    const dateCell = row[0] ?? '';
+    if (normalizeDateInput(dateCell) === target) {
+      const obj = {};
+      headers.forEach((header, idx) => {
+        if (!header) return;
+        obj[header] = row[idx] ?? '';
+      });
+      return { rowIndex: i + 1, row: obj, headers };
     }
   }
   return null;
@@ -233,6 +269,26 @@ async function askChatGPT(chatId, question, imageUrls = []) {
     return `⚠️ Datos muy grandes (${payload.length} chars ~ ${approxTokens} tokens). No consulté a OpenAI.`;
   }
 
+  const dateFromQuestion = extractDateFromText(question);
+  let dateContext = '';
+  let dataForPrompt = data;
+
+  if (dateFromQuestion) {
+    const detalleRow = await getDetalleRowByDate(dateFromQuestion);
+    if (detalleRow) {
+      dataForPrompt = { ...data, 'Detalle gral - Publi 1': [detalleRow.row] };
+      dateContext =
+        `📅 Fecha solicitada: ${dateFromQuestion}\n` +
+        `✅ Fila encontrada: ${detalleRow.rowIndex}\n` +
+        `✅ Usar SOLO esta fila para ese día.\n`;
+    } else {
+      dateContext =
+        `⚠️ No encontré la fecha ${dateFromQuestion} en la columna A de Detalle gral - Publi 1.\n` +
+        `Pedime otra fecha o confirmá el formato.\n`;
+      dataForPrompt = { ...data, 'Detalle gral - Publi 1': [] };
+    }
+  }
+
   const systemPrompt = `
 Sos un analista financiero y operativo. Tenés acceso completo a 8 hojas de Google Sheets.
 
@@ -240,6 +296,10 @@ Regla principal
 - Cada cierre es por día individual.
 - Si el usuario pregunta por un día específico, usá solo los datos de ese día.
 - La fecha está en la columna A de "Detalle gral - Publi 1".
+- No mezcles filas de fechas distintas.
+
+Orden exacto de columnas en "Detalle gral - Publi 1":
+FECHA, DEP, ARGENTUM, IGNITE/ROYAL, IGNITE/TRIBET, TIGER, MARSHALL, TOTAL A BAJAR, BANCO 1 00hs, BANCO 2 00hs, BANCO 3 00hs, BAJADAS CBU, PENDIENTE CIERRE, CIERRE COMPLETADO, INGRESO, EGRESO, PERDIDA, GASTOS, DIFERENCIA, OBS FALTANTES, OBS GASTOS, FECHA, OBSERVACION DEL DIA
 
 Paso a paso del cierre diario
 1) Recolección de datos
@@ -317,7 +377,7 @@ Hojas:
   const history = getChatHistory(chatId);
 
   const userContent = [
-    { type: 'text', text: `Datos completos:\n${payload}\n\nMensaje(s):\n${question}` },
+    { type: 'text', text: `${dateContext}Datos completos:\n${JSON.stringify(dataForPrompt)}\n\nMensaje(s):\n${question}` },
     ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
   ];
 
