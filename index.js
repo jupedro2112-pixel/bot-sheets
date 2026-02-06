@@ -49,6 +49,17 @@ const MAX_INPUT_TOKENS = Math.floor(
     (PRICE_INPUT_PER_1M / 1_000_000)
 );
 
+// Agrupador por chat
+const BATCH_WINDOW_MS = 5000;
+const batchQueue = new Map();
+
+// Pendientes de escritura por confirmación
+const pendingWrites = new Map();
+
+function getSheetConfig(name) {
+  return SHEETS_CONFIG.find((s) => s.name === name);
+}
+
 async function getSheetValues(sheetName, range) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
@@ -82,6 +93,7 @@ function parseWriteRequest(text) {
     sheetName: match[1].trim(),
     cell: match[2].trim().toUpperCase(),
     value: match[3].trim(),
+    source: 'texto',
   };
 }
 
@@ -132,7 +144,64 @@ function sanitizeTelegramText(text) {
   return text.replace(/[*#]/g, '');
 }
 
-async function askChatGPT(chatId, question) {
+function safeJsonExtract(text) {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeDateValue(value) {
+  if (!value) return '';
+  const raw = String(value).trim();
+  if (!raw) return '';
+  return raw
+    .replace(/\./g, '/')
+    .replace(/-/g, '/')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+}
+
+function normalizeDateInput(value) {
+  const normalized = normalizeDateValue(value);
+  if (!normalized) return '';
+
+  const parts = normalized.split('/');
+  if (parts.length === 3) {
+    const [p1, p2, p3] = parts;
+    if (p1.length === 4) return `${p1}/${p2.padStart(2, '0')}/${p3.padStart(2, '0')}`;
+    if (p3.length === 4) return `${p3}/${p2.padStart(2, '0')}/${p1.padStart(2, '0')}`;
+  }
+  return normalized;
+}
+
+async function findRowByDate(sheetName, dateStr) {
+  const config = getSheetConfig(sheetName);
+  if (!config) return null;
+
+  const columnA = await getSheetValues(sheetName, 'A:A');
+  const target = normalizeDateInput(dateStr);
+
+  for (let i = config.headerRow; i < columnA.length; i += 1) {
+    const cellValue = columnA[i]?.[0] ?? '';
+    const normalized = normalizeDateInput(cellValue);
+    if (normalized && normalized === target) {
+      return i + 1;
+    }
+  }
+  return null;
+}
+
+async function resolveCellByDate(sheetName, column, dateStr) {
+  const row = await findRowByDate(sheetName, dateStr);
+  if (!row) return null;
+  return `${column}${row}`;
+}
+
+async function askChatGPT(chatId, question, imageUrls = []) {
   const data = await loadAllSheets();
 
   const payload = JSON.stringify(data);
@@ -145,16 +214,57 @@ async function askChatGPT(chatId, question) {
   const systemPrompt = `
 Sos un analista financiero y operativo. Tenés acceso completo a 8 hojas de Google Sheets.
 
+Regla principal
+- Cada cierre es por día individual.
+- Si el usuario pregunta por un día específico, usá solo los datos de ese día.
+- La fecha está en la columna A de "Detalle gral - Publi 1".
+
+Paso a paso del cierre diario
+1) Recolección de datos
+- Cada día se ingresan depósitos, retiros, egresos, ingresos y observaciones en sus hojas.
+- Antes del cierre verificá que el día esté completo.
+
+2) Cálculo de totales
+- En "Detalle gral - Publi 1" se calculan totales de depósitos, retiros y movimientos.
+- Se suman depósitos por banco y se restan retiros para el saldo disponible.
+- Se calcula el total a bajar.
+
+3) Registro de bajadas
+- Bajadas se registra en "BAJADAS CBU".
+- Si hay pendiente de días anteriores, se anota en "PENDIENTE CIERRE" y se baja al día siguiente.
+
+4) Egresos e ingresos
+- Egresos y ingresos se registran en sus columnas correspondientes con respaldo.
+
+5) Cálculo de diferencias
+- Se calcula la diferencia entre total de depósitos y egresos.
+- Se registra en "DIFERENCIA".
+
+6) Observaciones
+- Incluir observaciones relevantes del día y de MOVIMIENTOS.
+
+7) Comprobantes
+- Para cerrar, exigir comprobantes que sumen exactamente la bajada.
+- Si hay parcial, dejarlo como pendiente para el siguiente día.
+
+8) Validación del cierre
+- Confirmar que totales, bajadas y pendientes estén correctos.
+
+9) Documentación
+- Resumir el cierre con totales, movimientos y observaciones.
+
 Tu tarea SIEMPRE es:
 1) Hacer un resumen general del estado global usando las formulas de las hojas.
 2) Responder la pregunta específica del usuario usando TODOS los datos.
 3) Detallar observaciones relevantes de la hoja MOVIMIENTOS dentro del cierre, de forma simple.
+4) Analizar comprobantes o capturas de panel cuando haya imagenes.
 
 Reglas del cierre:
 - El cierre debe seguir las formulas reales del Sheet.
 - Bajadas es la plata que hay en CBU.
 - Pedí comprobantes que sumen exactamente el monto de la celda de bajadas.
 - Si hay pendiente, aclarar que se baja durante el dia o el proximo dia y se anota en la celda de pendiente al cierre.
+- Si el usuario indica hoja, celda y valor, asumí que el sistema puede escribir en Sheets y no digas limitaciones.
 
 Además, tenés memoria de la conversación y debés mantener contexto.
 
@@ -179,6 +289,11 @@ Hojas:
 
   const history = getChatHistory(chatId);
 
+  const userContent = [
+    { type: 'text', text: `Datos completos:\n${payload}\n\nMensaje(s):\n${question}` },
+    ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
+  ];
+
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     temperature: 0.2,
@@ -186,41 +301,189 @@ Hojas:
     messages: [
       { role: 'system', content: systemPrompt },
       ...history,
-      { role: 'user', content: `Datos completos:\n${payload}\n\nPregunta: ${question}` },
+      { role: 'user', content: userContent },
     ],
   });
 
   return sanitizeTelegramText(response.choices[0].message.content || '');
 }
 
-async function analyzeImageWithOpenAI(imageUrl, caption = '') {
-  const systemPrompt = `
-Sos un analista financiero. Vas a leer comprobantes o datos de panel en una imagen.
+async function detectWriteFromImages(imageUrls, caption = '') {
+  if (!imageUrls.length) return null;
 
-Tu tarea:
-- Extraer montos, fechas y conceptos claros.
-- Si hay datos incompletos, pedilos.
-- Responder sin markdown y sin * ni #.
-- Usar emojis para claridad.
+  const systemPrompt = `
+Leé comprobantes o paneles y proponé una escritura en Google Sheets si es claro.
+
+Reglas:
+- Si podés inferir hoja y celda exacta, devolvé cell.
+- Si podés inferir hoja, columna y fecha, devolvé column y date.
+- La fecha del día está en columna A de "Detalle gral - Publi 1".
+
+Devolvé SOLO JSON con este formato:
+{"sheetName":"","cell":"","column":"","date":"","value":"","reason":""}
+
+Si no es claro, devolvé:
+{"sheetName":"","cell":"","column":"","date":"","value":"","reason":"insuficiente"}
 `;
 
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
-    temperature: 0.1,
-    max_tokens: 500,
+    temperature: 0,
+    max_tokens: 250,
     messages: [
       { role: 'system', content: systemPrompt },
       {
         role: 'user',
         content: [
           { type: 'text', text: `Contexto adicional: ${caption || 'sin texto'}` },
-          { type: 'image_url', image_url: { url: imageUrl } },
+          ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
         ],
       },
     ],
   });
 
-  return sanitizeTelegramText(response.choices[0].message.content || '');
+  const raw = response.choices[0].message.content || '';
+  const parsed = safeJsonExtract(raw);
+
+  if (!parsed) return null;
+
+  const sheetName = String(parsed.sheetName || '').trim();
+  const cell = String(parsed.cell || '').trim().toUpperCase();
+  const column = String(parsed.column || '').trim().toUpperCase();
+  const date = String(parsed.date || '').trim();
+  const value = String(parsed.value || '').trim();
+  const reason = String(parsed.reason || '').trim();
+
+  if (!sheetName || !value) return null;
+
+  return {
+    sheetName,
+    cell,
+    column,
+    date,
+    value,
+    source: 'imagen',
+    reason,
+  };
+}
+
+function enqueueBatch(chatId, item) {
+  if (!batchQueue.has(chatId)) {
+    batchQueue.set(chatId, { texts: [], images: [], timer: null });
+  }
+  const batch = batchQueue.get(chatId);
+  if (item.text) batch.texts.push(item.text);
+  if (item.imageUrl) batch.images.push(item.imageUrl);
+
+  if (batch.timer) clearTimeout(batch.timer);
+  batch.timer = setTimeout(() => processBatch(chatId), BATCH_WINDOW_MS);
+}
+
+async function processBatch(chatId) {
+  const batch = batchQueue.get(chatId);
+  if (!batch) return;
+
+  batchQueue.delete(chatId);
+
+  const combinedText = batch.texts.join('\n');
+  const imageUrls = batch.images;
+
+  try {
+    const writeRequests = [];
+    const unresolved = [];
+
+    for (const t of batch.texts) {
+      const wr = parseWriteRequest(t);
+      if (wr) writeRequests.push(wr);
+    }
+
+    const imageSuggestion = await detectWriteFromImages(imageUrls, combinedText);
+    if (imageSuggestion) {
+      if (imageSuggestion.cell) {
+        writeRequests.push({
+          sheetName: imageSuggestion.sheetName,
+          cell: imageSuggestion.cell,
+          value: imageSuggestion.value,
+          source: imageSuggestion.source,
+        });
+      } else if (imageSuggestion.column && imageSuggestion.date) {
+        const resolvedCell = await resolveCellByDate(
+          imageSuggestion.sheetName,
+          imageSuggestion.column,
+          imageSuggestion.date
+        );
+        if (resolvedCell) {
+          writeRequests.push({
+            sheetName: imageSuggestion.sheetName,
+            cell: resolvedCell,
+            value: imageSuggestion.value,
+            source: imageSuggestion.source,
+          });
+        } else {
+          unresolved.push(
+            `📅 No encontré la fecha ${imageSuggestion.date} en columna A de ${imageSuggestion.sheetName}`
+          );
+        }
+      } else if (imageSuggestion.reason && imageSuggestion.reason !== 'insuficiente') {
+        unresolved.push(`⚠️ No pude ubicar celda: ${imageSuggestion.reason}`);
+      }
+    }
+
+    let confirmationBlock = '';
+    if (writeRequests.length > 0) {
+      pendingWrites.set(chatId, writeRequests);
+
+      const details = writeRequests
+        .map(
+          (w, i) =>
+            `• ${i + 1}) Hoja ${w.sheetName} Celda ${w.cell} Valor ${w.value} (${w.source})`
+        )
+        .join('\n');
+
+      confirmationBlock =
+        `📝 Detecté ${writeRequests.length} carga(s) para Sheets.\n` +
+        `${details}\n` +
+        `✅ Respondé "confirmar" para guardar o "cancelar" para no guardar.\n\n`;
+    }
+
+    const unresolvedBlock = unresolved.length ? `${unresolved.join('\n')}\n\n` : '';
+
+    if (!combinedText && imageUrls.length === 0 && !confirmationBlock) return;
+
+    const answer = await askChatGPT(chatId, combinedText || 'Analizá comprobantes', imageUrls);
+
+    const finalAnswer = sanitizeTelegramText(`${confirmationBlock}${unresolvedBlock}${answer}`);
+    pushHistory(chatId, 'user', combinedText || '[imagenes]');
+    pushHistory(chatId, 'assistant', finalAnswer);
+
+    bot.sendMessage(chatId, finalAnswer);
+  } catch (err) {
+    console.error(err);
+    bot.sendMessage(chatId, 'Error al procesar el lote. Revisá logs.');
+  }
+}
+
+async function handleConfirmation(chatId, text) {
+  const pending = pendingWrites.get(chatId);
+  if (!pending || pending.length === 0) return false;
+
+  const lower = text.toLowerCase();
+  if (['confirmar', 'si', 'sí', 'ok', 'dale'].includes(lower)) {
+    for (const wr of pending) {
+      await writeSheetValue(wr.sheetName, wr.cell, wr.value);
+    }
+    pendingWrites.delete(chatId);
+    bot.sendMessage(chatId, sanitizeTelegramText('✅ Listo. Guardé los datos en Sheets 📌'));
+    return true;
+  }
+
+  if (['cancelar', 'no', 'stop'].includes(lower)) {
+    pendingWrites.delete(chatId);
+    bot.sendMessage(chatId, sanitizeTelegramText('❌ Cancelado. No guardé nada.'));
+    return true;
+  }
+
+  return false;
 }
 
 // Responde a cualquier mensaje de texto (sin comandos)
@@ -231,25 +494,13 @@ bot.on('message', async (msg) => {
   if (!text || text.startsWith('/')) return;
 
   try {
-    const writeRequest = parseWriteRequest(text);
-    if (writeRequest) {
-      await writeSheetValue(writeRequest.sheetName, writeRequest.cell, writeRequest.value);
-      const confirmMsg = sanitizeTelegramText(
-        `✅ Listo. Guardé en ${writeRequest.sheetName} ${writeRequest.cell} el valor ${writeRequest.value} 📌`
-      );
-      bot.sendMessage(chatId, confirmMsg);
-      return;
-    }
+    const handled = await handleConfirmation(chatId, text);
+    if (handled) return;
 
-    pushHistory(chatId, 'user', text);
-
-    const answer = await askChatGPT(chatId, text);
-
-    pushHistory(chatId, 'assistant', answer);
-    bot.sendMessage(chatId, answer);
+    enqueueBatch(chatId, { text });
   } catch (err) {
     console.error(err);
-    bot.sendMessage(chatId, 'Error al consultar datos. Revisá logs.');
+    bot.sendMessage(chatId, 'Error al procesar. Revisá logs.');
   }
 });
 
@@ -266,21 +517,10 @@ bot.on('photo', async (msg) => {
     const file = await bot.getFile(fileId);
     const imageUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_TOKEN}/${file.file_path}`;
 
-    const writeRequest = parseWriteRequest(caption);
-    const analysis = await analyzeImageWithOpenAI(imageUrl, caption);
-
-    if (writeRequest) {
-      await writeSheetValue(writeRequest.sheetName, writeRequest.cell, writeRequest.value);
-      const confirmMsg = sanitizeTelegramText(
-        `✅ Listo. Guardé en ${writeRequest.sheetName} ${writeRequest.cell} el valor ${writeRequest.value} 📌`
-      );
-      bot.sendMessage(chatId, confirmMsg);
-    }
-
-    bot.sendMessage(chatId, analysis);
+    enqueueBatch(chatId, { text: caption, imageUrl });
   } catch (err) {
     console.error(err);
-    bot.sendMessage(chatId, 'Error al analizar la imagen. Revisá logs.');
+    bot.sendMessage(chatId, 'Error al recibir la imagen. Revisá logs.');
   }
 });
 
