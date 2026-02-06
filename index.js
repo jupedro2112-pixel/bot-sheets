@@ -84,13 +84,23 @@ function sanitizeTelegramText(text) {
 
 function parseNumber(raw) {
   if (raw === null || raw === undefined) return null;
-  const cleaned = String(raw)
+  const text = String(raw).trim();
+  if (!text) return null;
+  const cleaned = text
     .replace(/\./g, '')
     .replace(/,/g, '.')
     .replace(/[^\d.-]/g, '');
   const parsed = Number(cleaned);
   if (Number.isNaN(parsed)) return null;
   return parsed;
+}
+
+function formatNumberES(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return '';
+  return new Intl.NumberFormat('es-AR', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
 }
 
 function parseThreeNumbers(text) {
@@ -282,22 +292,15 @@ Si un dato no está, usá null.
 
   let panelDeposit = 0;
   let panelRetiros = 0;
-  let panelVenta = 0;
   let panelCount = 0;
-  let hasVenta = false;
   let bajadoTotal = 0;
 
   items.forEach((item) => {
     if (item.type === 'panel') {
       const dep = parseNumber(item.depositos);
       const ret = parseNumber(item.retiros);
-      const ven = parseNumber(item.venta);
       if (dep !== null) panelDeposit += dep;
       if (ret !== null) panelRetiros += ret;
-      if (ven !== null) {
-        panelVenta += ven;
-        hasVenta = true;
-      }
       panelCount += 1;
     } else if (item.type === 'bajado') {
       const monto = parseNumber(item.monto);
@@ -307,7 +310,7 @@ Si un dato no está, usá null.
 
   let panelData = null;
   if (panelCount > 0) {
-    const ventaFinal = hasVenta ? panelVenta : panelDeposit - panelRetiros;
+    const ventaFinal = panelDeposit - panelRetiros;
     panelData = { venta: ventaFinal, depositos: panelDeposit, retiros: panelRetiros };
   }
 
@@ -325,21 +328,21 @@ function buildResumenValues(summary) {
 
   TEAM_ORDER.forEach((team) => {
     const t = summary.teams[team.key];
-    push(t.venta);
-    push(t.depositos);
-    push(t.retiros);
-    push(t.comision);
-    push(t.neto);
+    push(formatNumberES(t.venta));
+    push(formatNumberES(t.depositos));
+    push(formatNumberES(t.retiros));
+    push(formatNumberES(t.comision));
+    push(formatNumberES(t.neto));
   });
 
-  push(summary.totalNeto);
-  push(summary.totalABajar);
-  push(summary.bajadoReal);
-  push(summary.pendienteABajar);
-  push(summary.prestamosPedidos);
-  push(summary.prestamosDevueltos);
-  push(summary.prestamosPendientes);
-  push(summary.gastos);
+  push(formatNumberES(summary.totalNeto));
+  push(formatNumberES(summary.totalABajar));
+  push(formatNumberES(summary.bajadoReal));
+  push(formatNumberES(summary.pendienteABajar));
+  push(formatNumberES(summary.prestamosPedidos));
+  push(formatNumberES(summary.prestamosDevueltos));
+  push(formatNumberES(summary.prestamosPendientes));
+  push(formatNumberES(summary.gastos));
   push(summary.observaciones);
 
   return values;
@@ -348,21 +351,21 @@ function buildResumenValues(summary) {
 function summarizeCierre(summary) {
   const lines = [];
   lines.push(`📅 Fecha: ${summary.fecha}`);
-  lines.push(`📌 Pendiente anterior: ${summary.pendienteAnterior}`);
+  lines.push(`📌 Pendiente anterior: ${formatNumberES(summary.pendienteAnterior)}`);
   TEAM_ORDER.forEach((team) => {
     const t = summary.teams[team.key];
     lines.push(
-      `🎯 ${team.label}: Venta ${t.venta} | Depósitos ${t.depositos} | Retiros ${t.retiros} | Comisión ${t.comision} | Neto ${t.neto}`
+      `🎯 ${team.label}: Venta ${formatNumberES(t.venta)} | Depósitos ${formatNumberES(t.depositos)} | Retiros ${formatNumberES(t.retiros)} | Comisión ${formatNumberES(t.comision)} | Neto ${formatNumberES(t.neto)}`
     );
   });
-  lines.push(`💸 Gastos: ${summary.gastos}`);
-  lines.push(`💰 Total Neto: ${summary.totalNeto}`);
-  lines.push(`🏦 Total a Bajar: ${summary.totalABajar}`);
-  lines.push(`✅ Bajado Real: ${summary.bajadoReal}`);
-  lines.push(`⚠️ Pendiente a Bajar: ${summary.pendienteABajar}`);
-  lines.push(`🤝 Préstamos Pedidos: ${summary.prestamosPedidos}`);
-  lines.push(`🤝 Préstamos Devueltos: ${summary.prestamosDevueltos}`);
-  lines.push(`📌 Préstamos Pendientes: ${summary.prestamosPendientes}`);
+  lines.push(`💸 Gastos: ${formatNumberES(summary.gastos)}`);
+  lines.push(`💰 Total Neto: ${formatNumberES(summary.totalNeto)}`);
+  lines.push(`🏦 Total a Bajar: ${formatNumberES(summary.totalABajar)}`);
+  lines.push(`✅ Bajado Real: ${formatNumberES(summary.bajadoReal)}`);
+  lines.push(`⚠️ Pendiente a Bajar: ${formatNumberES(summary.pendienteABajar)}`);
+  lines.push(`🤝 Préstamos Pedidos: ${formatNumberES(summary.prestamosPedidos)}`);
+  lines.push(`🤝 Préstamos Devueltos: ${formatNumberES(summary.prestamosDevueltos)}`);
+  lines.push(`📌 Préstamos Pendientes: ${formatNumberES(summary.prestamosPendientes)}`);
   if (summary.alertas.length) {
     lines.push(`🚨 Alertas:`);
     summary.alertas.forEach((a) => lines.push(`- ${a}`));
@@ -411,33 +414,23 @@ async function handleCierreFlow(chatId, text) {
     bot.sendMessage(
       chatId,
       sanitizeTelegramText(
-        `🎯 ${team.label}: enviame Venta, Depósitos y Retiros (o foto del panel). La venta debe ser Depósitos - Retiros.`
+        `🎯 ${team.label}: enviame Depósitos y Retiros (o foto del panel). La venta se calcula como Depósitos - Retiros. Ej: 5000000, 4000000`
       )
     );
     return true;
   }
 
   if (session.step === 'equipo') {
-    const numbers = parseThreeNumbers(text);
+    const numbers = parseTwoNumbers(text);
     if (!numbers) {
       bot.sendMessage(
         chatId,
-        sanitizeTelegramText('⚠️ Formato inválido. Enviá 3 números: venta, depósitos, retiros.')
+        sanitizeTelegramText('⚠️ Formato inválido. Enviá 2 números: depósitos, retiros.')
       );
       return true;
     }
-    const [venta, depositos, retiros] = numbers;
-    const expectedVenta = Math.round(depositos - retiros);
-    if (Math.round(venta) !== expectedVenta) {
-      bot.sendMessage(
-        chatId,
-        sanitizeTelegramText(
-          `⚠️ La venta no coincide. Depósitos - Retiros = ${expectedVenta}. Enviá de nuevo: venta, depósitos, retiros.`
-        )
-      );
-      return true;
-    }
-
+    const [depositos, retiros] = numbers;
+    const venta = Math.round(depositos - retiros);
     const comision = Math.round(depositos * 0.015);
     const neto = Math.round(venta - comision);
 
@@ -450,7 +443,7 @@ async function handleCierreFlow(chatId, text) {
       bot.sendMessage(
         chatId,
         sanitizeTelegramText(
-          `🎯 ${next.label}: enviame Venta, Depósitos y Retiros (o foto del panel). La venta debe ser Depósitos - Retiros.`
+          `🎯 ${next.label}: enviame Depósitos y Retiros (o foto del panel). La venta se calcula como Depósitos - Retiros.`
         )
       );
       return true;
@@ -607,7 +600,7 @@ async function processBatch(chatId) {
   if (session) {
     if (!text) {
       if (session.step === 'equipo' && imageData?.panel) {
-        text = `${imageData.panel.venta}, ${imageData.panel.depositos}, ${imageData.panel.retiros}`;
+        text = `${imageData.panel.depositos}, ${imageData.panel.retiros}`;
       }
       if (session.step === 'bajado' && imageData?.bajadoTotal !== null) {
         text = `${imageData.bajadoTotal}`;
