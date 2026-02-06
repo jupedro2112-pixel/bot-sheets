@@ -103,24 +103,20 @@ Hojas:
   return response.choices[0].message.content;
 }
 
-// Comando: /pregunta lo que quieras
-bot.onText(/\/pregunta (.+)/, async (msg, match) => {
+// Responde a cualquier mensaje de texto (sin comandos)
+bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
-  const question = match[1];
+  const text = (msg.text || '').trim();
+
+  if (!text || text.startsWith('/')) return;
 
   try {
-    const answer = await askChatGPT(question);
+    const answer = await askChatGPT(text);
     bot.sendMessage(chatId, answer);
   } catch (err) {
     console.error(err);
     bot.sendMessage(chatId, 'Error al consultar datos. Revisá logs.');
   }
-});
-
-// Comando de prueba rápida
-bot.onText(/\/resumen/, async (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, 'Escribí /pregunta y tu consulta. Ej: /pregunta Resumen general de hoy');
 });
 
 app.get('/', (req, res) => res.send('Bot activo'));
