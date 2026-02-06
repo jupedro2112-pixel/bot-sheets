@@ -5,7 +5,9 @@ const { google } = require('googleapis');
 const OpenAI = require('openai');
 
 const app = express();
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+app.use(express.json());
+
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /* ================= CONFIG OPENAI ================= */
@@ -252,14 +254,28 @@ Tu tarea es:
   return response.output_text;
 }
 
-/* ================= TELEGRAM ================= */
+/* ================= TELEGRAM (WEBHOOK) ================= */
 
-// Limpia cualquier webhook previo (evita conflicto con polling)
+// Ruta de webhook
+const WEBHOOK_PATH = '/telegram-webhook';
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+
+app.post(WEBHOOK_PATH, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// Setear webhook al iniciar
 (async () => {
   try {
-    await bot.deleteWebhook({ drop_pending_updates: true });
+    if (!WEBHOOK_URL) {
+      console.error('Falta WEBHOOK_URL en variables de entorno.');
+      return;
+    }
+    await bot.setWebHook(`${WEBHOOK_URL}${WEBHOOK_PATH}`, { drop_pending_updates: true });
+    console.log('Webhook configurado:', `${WEBHOOK_URL}${WEBHOOK_PATH}`);
   } catch (err) {
-    console.error('Error deleteWebhook:', err);
+    console.error('Error setWebHook:', err);
   }
 })();
 
@@ -281,25 +297,6 @@ bot.on('message', async msg => {
 
 /* ================= SERVER ================= */
 
-app.get('/', (_, res) => res.send('Bot financiero activo'));
+app.get('/', (_, res) => res.send('Bot financiero activo (webhook)'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor listo'));
-
-/* ================= SHUTDOWN ================= */
-
-// Apaga polling al cerrar el proceso (evita 409 en deploys)
-process.on('SIGTERM', async () => {
-  try {
-    await bot.stopPolling();
-  } finally {
-    process.exit(0);
-  }
-});
-
-process.on('SIGINT', async () => {
-  try {
-    await bot.stopPolling();
-  } finally {
-    process.exit(0);
-  }
-});
