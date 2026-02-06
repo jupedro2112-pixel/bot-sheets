@@ -636,14 +636,27 @@ async function handleCierreFlow(chatId, text) {
     const prestamosPendientes = Math.round(session.prestamosPedidos - session.prestamosDevueltos);
 
     const alertas = [];
-    if (pendienteABajar !== 0) {
-      alertas.push('El bajado real no coincide con el total a bajar.');
+    if (pendienteABajar > 0) {
+      alertas.push('Falta bajar dinero respecto al total.');
+    }
+    if (pendienteABajar < 0) {
+      alertas.push('Se bajó más dinero del total a bajar.');
     }
     if (prestamosPendientes !== 0) {
       alertas.push('Hay préstamos pendientes de devolución.');
     }
     if (totalNeto < 0) {
       alertas.push('Total neto negativo: revisar balances por equipo.');
+    }
+
+    const minTeam = TEAM_ORDER.reduce((min, team) => {
+      const t = session.teams[team.key];
+      if (!min || t.neto < min.neto) return { key: team.label, neto: t.neto };
+      return min;
+    }, null);
+
+    if (minTeam && minTeam.neto < 0) {
+      alertas.push(`Revisar equipo con neto más negativo: ${minTeam.key} (${minTeam.neto}).`);
     }
 
     const summary = {
