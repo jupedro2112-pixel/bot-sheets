@@ -44,7 +44,6 @@ const MAX_HISTORY = 8;
 
 let cachedSummary = null;
 let cachedAt = 0;
-const SUMMARY_TTL_MS = 60 * 1000; // 1 minuto
 
 /* ================= HELPERS ================= */
 
@@ -199,6 +198,17 @@ function detectChanges(prev, curr) {
   return alerts;
 }
 
+/* ================= CACHE REFRESH ================= */
+
+async function refreshCache(questionForContext = '') {
+  const data = await loadAllSheets();
+  const summary = buildFinancialSummary(data, questionForContext);
+  summary.alertas = detectChanges(cachedSummary, summary);
+  cachedSummary = summary;
+  cachedAt = Date.now();
+  return summary;
+}
+
 /* ================= CHATGPT ================= */
 
 function getChatHistory(chatId) {
@@ -215,17 +225,8 @@ function pushHistory(chatId, role, content) {
 }
 
 async function askChatGPT(chatId, question) {
-  const now = Date.now();
-  let summary;
-
-  if (cachedSummary && now - cachedAt < SUMMARY_TTL_MS) {
-    summary = cachedSummary;
-  } else {
-    const data = await loadAllSheets();
-    summary = buildFinancialSummary(data, question);
-    summary.alertas = detectChanges(cachedSummary, summary);
-    cachedSummary = summary;
-    cachedAt = now;
+  if (!cachedSummary) {
+    await refreshCache(question);
   }
 
   const systemPrompt = `
@@ -246,7 +247,7 @@ Tu tarea es:
       ...history,
       {
         role: 'user',
-        content: `Resumen financiero actualizado:\n${JSON.stringify(summary)}\n\nPregunta: ${question}`,
+        content: `Resumen financiero actualizado:\n${JSON.stringify(cachedSummary)}\n\nPregunta: ${question}`,
       },
     ],
   });
@@ -256,7 +257,6 @@ Tu tarea es:
 
 /* ================= TELEGRAM (WEBHOOK) ================= */
 
-// Ruta de webhook
 const WEBHOOK_PATH = '/telegram-webhook';
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
@@ -265,7 +265,6 @@ app.post(WEBHOOK_PATH, (req, res) => {
   res.sendStatus(200);
 });
 
-// Setear webhook al iniciar
 (async () => {
   try {
     if (!WEBHOOK_URL) {
@@ -278,6 +277,24 @@ app.post(WEBHOOK_PATH, (req, res) => {
     console.error('Error setWebHook:', err);
   }
 })();
+
+/* ================= WEBHOOK SHEETS REFRESH ================= */
+
+const REFRESH_SECRET = process.env.REFRESH_SECRET;
+
+// Endpoint que llamará Apps Script
+app.post('/sheets-refresh', async (req, res) => {
+  try {
+    if (!REFRESH_SECRET || req.get('x-refresh-secret') !== REFRESH_SECRET) {
+      return res.status(401).send('Unauthorized');
+    }
+    await refreshCache();
+    res.send('OK');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error');
+  }
+});
 
 bot.on('message', async msg => {
   const chatId = msg.chat.id;
