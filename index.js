@@ -60,6 +60,20 @@ function getSheetConfig(name) {
   return SHEETS_CONFIG.find((s) => s.name === name);
 }
 
+function makeUniqueHeaders(headers) {
+  const seen = {};
+  return headers.map((header) => {
+    const key = (header || '').trim();
+    if (!key) return '';
+    if (!seen[key]) {
+      seen[key] = 1;
+      return key;
+    }
+    seen[key] += 1;
+    return `${key}_${seen[key]}`;
+  });
+}
+
 async function getSheetValues(sheetName, range) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
@@ -70,6 +84,47 @@ async function getSheetValues(sheetName, range) {
   });
 
   return res.data.values || [];
+}
+
+async function getSheetGridData(sheetName, range, headerRowIndex) {
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+
+  const res = await sheets.spreadsheets.get({
+    spreadsheetId: SHEET_ID,
+    ranges: [`${sheetName}!${range}`],
+    includeGridData: true,
+  });
+
+  const grid = res.data.sheets?.[0]?.data?.[0];
+  const rowData = grid?.rowData || [];
+
+  const rawHeaders =
+    rowData[headerRowIndex - 1]?.values?.map((cell) => cell.formattedValue || '') || [];
+  const headers = makeUniqueHeaders(rawHeaders);
+  const dataRows = rowData.slice(headerRowIndex);
+
+  const valuesRows = [];
+  const formulaRows = [];
+
+  dataRows.forEach((row) => {
+    const obj = {};
+    const fobj = {};
+
+    headers.forEach((header, idx) => {
+      if (!header) return;
+      const cell = row.values?.[idx] || {};
+      const value = cell.formattedValue ?? '';
+      const formula = cell.userEnteredValue?.formulaValue ?? '';
+      obj[header] = value;
+      fobj[header] = { value, formula };
+    });
+
+    valuesRows.push(obj);
+    formulaRows.push(fobj);
+  });
+
+  return { valuesRows, formulaRows, headers };
 }
 
 async function writeSheetValue(sheetName, cell, value) {
@@ -122,7 +177,7 @@ function parseDeleteRequest(text) {
 function rowsToObjects(values, headerRowIndex) {
   if (!values.length || values.length < headerRowIndex) return [];
 
-  const headers = values[headerRowIndex - 1].map((h) => (h || '').trim());
+  const headers = makeUniqueHeaders(values[headerRowIndex - 1].map((h) => (h || '').trim()));
   const dataRows = values.slice(headerRowIndex);
 
   return dataRows.map((row) => {
@@ -145,6 +200,21 @@ async function loadAllSheets() {
   }
 
   return allData;
+}
+
+async function loadAllSheetsWithFormulas() {
+  const valuesData = {};
+  const formulasData = {};
+  const headersData = {};
+
+  for (const sheet of SHEETS_CONFIG) {
+    const grid = await getSheetGridData(sheet.name, sheet.range, sheet.headerRow);
+    valuesData[sheet.name] = grid.valuesRows;
+    formulasData[sheet.name] = grid.formulaRows;
+    headersData[sheet.name] = grid.headers;
+  }
+
+  return { valuesData, formulasData, headersData };
 }
 
 function getChatHistory(chatId) {
@@ -227,27 +297,20 @@ async function findRowByDate(sheetName, dateStr) {
   return null;
 }
 
-async function getDetalleRowByDate(dateStr) {
+async function getDetalleRowByDateFromLoaded(valuesData, formulasData, dateStr) {
   const sheetName = 'Detalle gral - Publi 1';
-  const config = getSheetConfig(sheetName);
-  if (!config) return null;
-
-  const values = await getSheetValues(sheetName, 'A:Z');
-  if (!values.length || values.length < config.headerRow) return null;
-
-  const headers = values[config.headerRow - 1].map((h) => (h || '').trim());
+  const rows = valuesData[sheetName] || [];
+  const fRows = formulasData[sheetName] || [];
   const target = normalizeDateInput(dateStr);
 
-  for (let i = config.headerRow; i < values.length; i += 1) {
-    const row = values[i] || [];
-    const dateCell = row[0] ?? '';
-    if (normalizeDateInput(dateCell) === target) {
-      const obj = {};
-      headers.forEach((header, idx) => {
-        if (!header) return;
-        obj[header] = row[idx] ?? '';
-      });
-      return { rowIndex: i + 1, row: obj, headers };
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i] || {};
+    if (normalizeDateInput(row.FECHA) === target) {
+      return {
+        rowIndex: getSheetConfig(sheetName).headerRow + i,
+        row,
+        formulaRow: fRows[i] || {},
+      };
     }
   }
   return null;
@@ -260,23 +323,23 @@ async function resolveCellByDate(sheetName, column, dateStr) {
 }
 
 async function askChatGPT(chatId, question, imageUrls = []) {
-  const data = await loadAllSheets();
+  const { valuesData, formulasData } = await loadAllSheetsWithFormulas();
 
-  const payload = JSON.stringify(data);
-  const approxTokens = Math.ceil(payload.length / 4);
-
-  if (approxTokens > MAX_INPUT_TOKENS) {
-    return `⚠️ Datos muy grandes (${payload.length} chars ~ ${approxTokens} tokens). No consulté a OpenAI.`;
-  }
+  let dateContext = '';
+  let dataForPrompt = valuesData;
+  let formulasForPrompt = formulasData;
 
   const dateFromQuestion = extractDateFromText(question);
-  let dateContext = '';
-  let dataForPrompt = data;
-
   if (dateFromQuestion) {
-    const detalleRow = await getDetalleRowByDate(dateFromQuestion);
+    const detalleRow = await getDetalleRowByDateFromLoaded(
+      valuesData,
+      formulasData,
+      dateFromQuestion
+    );
+
     if (detalleRow) {
-      dataForPrompt = { ...data, 'Detalle gral - Publi 1': [detalleRow.row] };
+      dataForPrompt = { ...valuesData, 'Detalle gral - Publi 1': [detalleRow.row] };
+      formulasForPrompt = { ...formulasData, 'Detalle gral - Publi 1': [detalleRow.formulaRow] };
       dateContext =
         `📅 Fecha solicitada: ${dateFromQuestion}\n` +
         `✅ Fila encontrada: ${detalleRow.rowIndex}\n` +
@@ -285,12 +348,21 @@ async function askChatGPT(chatId, question, imageUrls = []) {
       dateContext =
         `⚠️ No encontré la fecha ${dateFromQuestion} en la columna A de Detalle gral - Publi 1.\n` +
         `Pedime otra fecha o confirmá el formato.\n`;
-      dataForPrompt = { ...data, 'Detalle gral - Publi 1': [] };
+      dataForPrompt = { ...valuesData, 'Detalle gral - Publi 1': [] };
+      formulasForPrompt = { ...formulasData, 'Detalle gral - Publi 1': [] };
     }
   }
 
+  const valuesPayload = JSON.stringify(dataForPrompt);
+  const formulasPayload = JSON.stringify(formulasForPrompt);
+  const approxTokens = Math.ceil((valuesPayload.length + formulasPayload.length) / 4);
+
+  if (approxTokens > MAX_INPUT_TOKENS) {
+    return `⚠️ Datos muy grandes (${valuesPayload.length + formulasPayload.length} chars ~ ${approxTokens} tokens). No consulté a OpenAI.`;
+  }
+
   const systemPrompt = `
-Sos un analista financiero y operativo. Tenés acceso completo a 8 hojas de Google Sheets.
+Sos un analista financiero y operativo con conocimiento básico de finanzas y cierres de equipos.
 
 Regla principal
 - Cada cierre es por día individual.
@@ -299,7 +371,7 @@ Regla principal
 - No mezcles filas de fechas distintas.
 
 Orden exacto de columnas en "Detalle gral - Publi 1":
-FECHA, DEP, ARGENTUM, IGNITE/ROYAL, IGNITE/TRIBET, TIGER, MARSHALL, TOTAL A BAJAR, BANCO 1 00hs, BANCO 2 00hs, BANCO 3 00hs, BAJADAS CBU, PENDIENTE CIERRE, CIERRE COMPLETADO, INGRESO, EGRESO, PERDIDA, GASTOS, DIFERENCIA, OBS FALTANTES, OBS GASTOS, FECHA, OBSERVACION DEL DIA
+FECHA, DEP, ARGENTUM, IGNITE/ROYAL, IGNITE/TRIBET, TIGER, MARSHALL, TOTAL A BAJAR, BANCO 1 00hs, BANCO 2 00hs, BANCO 3 00hs, BAJADAS CBU, PENDIENTE CIERRE, CIERRE COMPLETADO, INGRESO, EGRESO, PERDIDA, GASTOS, DIFERENCIA, OBS FALTANTES, OBS GASTOS, FECHA_2, OBSERVACION DEL DIA
 
 Paso a paso del cierre diario
 1) Recolección de datos
@@ -339,12 +411,14 @@ Reglas adicionales
 - Si falta un dato para cerrar correctamente, pedilo de forma clara.
 - Si el usuario aporta un dato, proponé cargarlo automáticamente en la celda correspondiente.
 - Podés escribir o borrar datos solo con autorización explícita del usuario.
+- Tenés acceso a valores y a formulas, y debés explicar el porqué del número cuando exista fórmula.
 
 Tu tarea SIEMPRE es:
 1) Hacer un resumen general del estado global usando las formulas de las hojas.
 2) Responder la pregunta específica del usuario usando TODOS los datos.
 3) Detallar observaciones relevantes de la hoja MOVIMIENTOS dentro del cierre, de forma simple.
 4) Analizar comprobantes o capturas de panel cuando haya imagenes.
+5) Explicar cómo se llegó a un número si hay fórmula disponible.
 
 Reglas del cierre:
 - El cierre debe seguir las formulas reales del Sheet.
@@ -377,7 +451,14 @@ Hojas:
   const history = getChatHistory(chatId);
 
   const userContent = [
-    { type: 'text', text: `${dateContext}Datos completos:\n${JSON.stringify(dataForPrompt)}\n\nMensaje(s):\n${question}` },
+    {
+      type: 'text',
+      text:
+        `${dateContext}` +
+        `Datos completos:\n${valuesPayload}\n\n` +
+        `Formulas completas:\n${formulasPayload}\n\n` +
+        `Mensaje(s):\n${question}`,
+    },
     ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
   ];
 
