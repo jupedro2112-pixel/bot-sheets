@@ -43,6 +43,9 @@ const MAX_COST_USD = 0.5;
 // Máximo de tokens de salida para controlar gasto
 const MAX_OUTPUT_TOKENS = 800;
 
+// Límite duro de tokens
+const MAX_TOTAL_TOKENS = 1_000_000;
+
 // Cálculo de tokens máximos de entrada según presupuesto
 const MAX_INPUT_TOKENS = Math.floor(
   (MAX_COST_USD - (MAX_OUTPUT_TOKENS * PRICE_OUTPUT_PER_1M) / 1_000_000) /
@@ -74,6 +77,36 @@ function makeUniqueHeaders(headers) {
   });
 }
 
+function estimateTokensFromText(text) {
+  if (!text) return 0;
+  return Math.ceil(String(text).length / 4);
+}
+
+function estimateTokensFromContent(content) {
+  if (!content) return 0;
+  if (typeof content === 'string') return estimateTokensFromText(content);
+
+  if (Array.isArray(content)) {
+    let total = 0;
+    for (const item of content) {
+      if (item.type === 'text') {
+        total += estimateTokensFromText(item.text);
+      } else if (item.type === 'image_url') {
+        total += 100;
+      }
+    }
+    return total;
+  }
+  return 0;
+}
+
+function logTokenCost({ status, inputTokens, outputTokens, costUsd, note }) {
+  const msg =
+    `[TOKENS] status=${status} input=${inputTokens} output=${outputTokens} ` +
+    `cost_usd=${costUsd.toFixed(6)}${note ? ` note=${note}` : ''}`;
+  console.log(msg);
+}
+
 async function getSheetValues(sheetName, range) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
@@ -86,13 +119,14 @@ async function getSheetValues(sheetName, range) {
   return res.data.values || [];
 }
 
-async function getSheetGridData(sheetName, range, headerRowIndex) {
+async function getRowGridData(sheetName, rowNumber, headerRowIndex) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
 
+  const range = `${sheetName}!A${headerRowIndex}:Z${rowNumber}`;
   const res = await sheets.spreadsheets.get({
     spreadsheetId: SHEET_ID,
-    ranges: [`${sheetName}!${range}`],
+    ranges: [range],
     includeGridData: true,
   });
 
@@ -102,29 +136,22 @@ async function getSheetGridData(sheetName, range, headerRowIndex) {
   const rawHeaders =
     rowData[headerRowIndex - 1]?.values?.map((cell) => cell.formattedValue || '') || [];
   const headers = makeUniqueHeaders(rawHeaders);
-  const dataRows = rowData.slice(headerRowIndex);
 
-  const valuesRows = [];
-  const formulaRows = [];
+  const targetRow = rowData[rowNumber - headerRowIndex] || { values: [] };
 
-  dataRows.forEach((row) => {
-    const obj = {};
-    const fobj = {};
+  const obj = {};
+  const fobj = {};
 
-    headers.forEach((header, idx) => {
-      if (!header) return;
-      const cell = row.values?.[idx] || {};
-      const value = cell.formattedValue ?? '';
-      const formula = cell.userEnteredValue?.formulaValue ?? '';
-      obj[header] = value;
-      fobj[header] = { value, formula };
-    });
-
-    valuesRows.push(obj);
-    formulaRows.push(fobj);
+  headers.forEach((header, idx) => {
+    if (!header) return;
+    const cell = targetRow.values?.[idx] || {};
+    const value = cell.formattedValue ?? '';
+    const formula = cell.userEnteredValue?.formulaValue ?? '';
+    obj[header] = value;
+    fobj[header] = { value, formula };
   });
 
-  return { valuesRows, formulaRows, headers };
+  return { row: obj, formulaRow: fobj, headers };
 }
 
 async function writeSheetValue(sheetName, cell, value) {
@@ -200,21 +227,6 @@ async function loadAllSheets() {
   }
 
   return allData;
-}
-
-async function loadAllSheetsWithFormulas() {
-  const valuesData = {};
-  const formulasData = {};
-  const headersData = {};
-
-  for (const sheet of SHEETS_CONFIG) {
-    const grid = await getSheetGridData(sheet.name, sheet.range, sheet.headerRow);
-    valuesData[sheet.name] = grid.valuesRows;
-    formulasData[sheet.name] = grid.formulaRows;
-    headersData[sheet.name] = grid.headers;
-  }
-
-  return { valuesData, formulasData, headersData };
 }
 
 function getChatHistory(chatId) {
@@ -297,20 +309,27 @@ async function findRowByDate(sheetName, dateStr) {
   return null;
 }
 
-async function getDetalleRowByDateFromLoaded(valuesData, formulasData, dateStr) {
+async function getDetalleRowByDate(dateStr) {
   const sheetName = 'Detalle gral - Publi 1';
-  const rows = valuesData[sheetName] || [];
-  const fRows = formulasData[sheetName] || [];
+  const config = getSheetConfig(sheetName);
+  if (!config) return null;
+
+  const values = await getSheetValues(sheetName, 'A:Z');
+  if (!values.length || values.length < config.headerRow) return null;
+
+  const headers = makeUniqueHeaders(values[config.headerRow - 1].map((h) => (h || '').trim()));
   const target = normalizeDateInput(dateStr);
 
-  for (let i = 0; i < rows.length; i += 1) {
-    const row = rows[i] || {};
-    if (normalizeDateInput(row.FECHA) === target) {
-      return {
-        rowIndex: getSheetConfig(sheetName).headerRow + i,
-        row,
-        formulaRow: fRows[i] || {},
-      };
+  for (let i = config.headerRow; i < values.length; i += 1) {
+    const row = values[i] || [];
+    const dateCell = row[0] ?? '';
+    if (normalizeDateInput(dateCell) === target) {
+      const obj = {};
+      headers.forEach((header, idx) => {
+        if (!header) return;
+        obj[header] = row[idx] ?? '';
+      });
+      return { rowIndex: i + 1, row: obj, headers };
     }
   }
   return null;
@@ -323,23 +342,22 @@ async function resolveCellByDate(sheetName, column, dateStr) {
 }
 
 async function askChatGPT(chatId, question, imageUrls = []) {
-  const { valuesData, formulasData } = await loadAllSheetsWithFormulas();
+  const valuesData = await loadAllSheets();
 
   let dateContext = '';
   let dataForPrompt = valuesData;
-  let formulasForPrompt = formulasData;
+  let formulasForPrompt = {};
 
   const dateFromQuestion = extractDateFromText(question);
-  if (dateFromQuestion) {
-    const detalleRow = await getDetalleRowByDateFromLoaded(
-      valuesData,
-      formulasData,
-      dateFromQuestion
-    );
 
+  if (dateFromQuestion) {
+    const detalleRow = await getDetalleRowByDate(dateFromQuestion);
     if (detalleRow) {
       dataForPrompt = { ...valuesData, 'Detalle gral - Publi 1': [detalleRow.row] };
-      formulasForPrompt = { ...formulasData, 'Detalle gral - Publi 1': [detalleRow.formulaRow] };
+      const sheetName = 'Detalle gral - Publi 1';
+      const rowNumber = detalleRow.rowIndex;
+      const grid = await getRowGridData(sheetName, rowNumber, getSheetConfig(sheetName).headerRow);
+      formulasForPrompt = { [sheetName]: [grid.formulaRow] };
       dateContext =
         `📅 Fecha solicitada: ${dateFromQuestion}\n` +
         `✅ Fila encontrada: ${detalleRow.rowIndex}\n` +
@@ -349,16 +367,29 @@ async function askChatGPT(chatId, question, imageUrls = []) {
         `⚠️ No encontré la fecha ${dateFromQuestion} en la columna A de Detalle gral - Publi 1.\n` +
         `Pedime otra fecha o confirmá el formato.\n`;
       dataForPrompt = { ...valuesData, 'Detalle gral - Publi 1': [] };
-      formulasForPrompt = { ...formulasData, 'Detalle gral - Publi 1': [] };
+      formulasForPrompt = { 'Detalle gral - Publi 1': [] };
     }
   }
 
   const valuesPayload = JSON.stringify(dataForPrompt);
   const formulasPayload = JSON.stringify(formulasForPrompt);
-  const approxTokens = Math.ceil((valuesPayload.length + formulasPayload.length) / 4);
+  let approxTokens = Math.ceil((valuesPayload.length + formulasPayload.length) / 4);
 
   if (approxTokens > MAX_INPUT_TOKENS) {
-    return `⚠️ Datos muy grandes (${valuesPayload.length + formulasPayload.length} chars ~ ${approxTokens} tokens). No consulté a OpenAI.`;
+    formulasForPrompt = {};
+    approxTokens = Math.ceil(valuesPayload.length / 4);
+
+    if (approxTokens > MAX_INPUT_TOKENS) {
+      const estCost = (approxTokens * PRICE_INPUT_PER_1M) / 1_000_000;
+      logTokenCost({
+        status: 'rejected_budget',
+        inputTokens: approxTokens,
+        outputTokens: 0,
+        costUsd: estCost,
+        note: 'excede presupuesto',
+      });
+      return `⚠️ Datos muy grandes (${valuesPayload.length} chars ~ ${approxTokens} tokens). No consulté a OpenAI.`;
+    }
   }
 
   const systemPrompt = `
@@ -373,61 +404,11 @@ Regla principal
 Orden exacto de columnas en "Detalle gral - Publi 1":
 FECHA, DEP, ARGENTUM, IGNITE/ROYAL, IGNITE/TRIBET, TIGER, MARSHALL, TOTAL A BAJAR, BANCO 1 00hs, BANCO 2 00hs, BANCO 3 00hs, BAJADAS CBU, PENDIENTE CIERRE, CIERRE COMPLETADO, INGRESO, EGRESO, PERDIDA, GASTOS, DIFERENCIA, OBS FALTANTES, OBS GASTOS, FECHA_2, OBSERVACION DEL DIA
 
-Paso a paso del cierre diario
-1) Recolección de datos
-- Cada día se ingresan depósitos, retiros, egresos, ingresos y observaciones en sus hojas.
-- Antes del cierre verificá que el día esté completo.
-
-2) Cálculo de totales
-- En "Detalle gral - Publi 1" se calculan totales de depósitos, retiros y movimientos.
-- Se suman depósitos por banco y se restan retiros para el saldo disponible.
-- Se calcula el total a bajar.
-
-3) Registro de bajadas
-- Bajadas se registra en "BAJADAS CBU".
-- Si hay pendiente de días anteriores, se anota en "PENDIENTE CIERRE" y se baja al día siguiente.
-
-4) Egresos e ingresos
-- Egresos y ingresos se registran en sus columnas correspondientes con respaldo.
-
-5) Cálculo de diferencias
-- Se calcula la diferencia entre total de depósitos y egresos.
-- Se registra en "DIFERENCIA".
-
-6) Observaciones
-- Incluir observaciones relevantes del día y de MOVIMIENTOS.
-
-7) Comprobantes
-- Para cerrar, exigir comprobantes que sumen exactamente la bajada.
-- Si hay parcial, dejarlo como pendiente para el siguiente día.
-
-8) Validación del cierre
-- Confirmar que totales, bajadas y pendientes estén correctos.
-
-9) Documentación
-- Resumir el cierre con totales, movimientos y observaciones.
-
 Reglas adicionales
 - Si falta un dato para cerrar correctamente, pedilo de forma clara.
 - Si el usuario aporta un dato, proponé cargarlo automáticamente en la celda correspondiente.
 - Podés escribir o borrar datos solo con autorización explícita del usuario.
-- Tenés acceso a valores y a formulas, y debés explicar el porqué del número cuando exista fórmula.
-
-Tu tarea SIEMPRE es:
-1) Hacer un resumen general del estado global usando las formulas de las hojas.
-2) Responder la pregunta específica del usuario usando TODOS los datos.
-3) Detallar observaciones relevantes de la hoja MOVIMIENTOS dentro del cierre, de forma simple.
-4) Analizar comprobantes o capturas de panel cuando haya imagenes.
-5) Explicar cómo se llegó a un número si hay fórmula disponible.
-
-Reglas del cierre:
-- El cierre debe seguir las formulas reales del Sheet.
-- Bajadas es la plata que hay en CBU.
-- Pedí comprobantes que sumen exactamente el monto de la celda de bajadas.
-- Si hay pendiente, aclarar que se baja durante el dia o el proximo dia y se anota en la celda de pendiente al cierre.
-- Si el usuario indica hoja, celda y valor, asumí que el sistema puede escribir en Sheets y no digas limitaciones.
-
-Además, tenés memoria de la conversación y debés mantener contexto.
+- Tenés acceso a valores y, cuando haya, fórmulas. Explicá el porqué del número si hay fórmula.
 
 Estilo:
 - No uses * ni #.
@@ -436,16 +417,6 @@ Estilo:
 
 Si faltan datos, explicá qué falta.
 Si hay números, calculá y explicá.
-
-Hojas:
-- Detalle gral - Publi 1
-- MOVIMIENTOS
-- ARGENTUM
-- ROYAL JYG
-- TRIBET BUFFA
-- TIGER
-- MARSHALL
-- TOTAL USDT
 `;
 
   const history = getChatHistory(chatId);
@@ -456,21 +427,54 @@ Hojas:
       text:
         `${dateContext}` +
         `Datos completos:\n${valuesPayload}\n\n` +
-        `Formulas completas:\n${formulasPayload}\n\n` +
+        `Formulas completas:\n${JSON.stringify(formulasForPrompt)}\n\n` +
         `Mensaje(s):\n${question}`,
     },
     ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
   ];
 
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history,
+    { role: 'user', content: userContent },
+  ];
+
+  const estimatedInputTokens =
+    estimateTokensFromText(systemPrompt) +
+    history.reduce((sum, m) => sum + estimateTokensFromContent(m.content), 0) +
+    estimateTokensFromContent(userContent);
+
+  if (estimatedInputTokens > MAX_TOTAL_TOKENS) {
+    const estCost = (estimatedInputTokens * PRICE_INPUT_PER_1M) / 1_000_000;
+    logTokenCost({
+      status: 'rejected_hard_limit',
+      inputTokens: estimatedInputTokens,
+      outputTokens: 0,
+      costUsd: estCost,
+      note: 'supera 1M tokens',
+    });
+    return `⚠️ Request demasiado grande (${estimatedInputTokens} tokens estimados). No consulté a OpenAI.`;
+  }
+
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     temperature: 0.2,
     max_tokens: MAX_OUTPUT_TOKENS,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      ...history,
-      { role: 'user', content: userContent },
-    ],
+    messages,
+  });
+
+  const usage = response.usage || {};
+  const inputTokens = usage.prompt_tokens ?? estimatedInputTokens;
+  const outputTokens = usage.completion_tokens ?? MAX_OUTPUT_TOKENS;
+  const costUsd =
+    (inputTokens * PRICE_INPUT_PER_1M) / 1_000_000 +
+    (outputTokens * PRICE_OUTPUT_PER_1M) / 1_000_000;
+
+  logTokenCost({
+    status: 'accepted',
+    inputTokens,
+    outputTokens,
+    costUsd,
   });
 
   return sanitizeTelegramText(response.choices[0].message.content || '');
