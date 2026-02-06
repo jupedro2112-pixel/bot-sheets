@@ -13,7 +13,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
 const auth = new google.auth.GoogleAuth({
   credentials: serviceAccount,
-  scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
 const SHEET_ID = process.env.SHEET_ID;
@@ -59,6 +59,30 @@ async function getSheetValues(sheetName, range) {
   });
 
   return res.data.values || [];
+}
+
+async function writeSheetValue(sheetName, cell, value) {
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `${sheetName}!${cell}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [[value]],
+    },
+  });
+}
+
+function parseWriteRequest(text) {
+  const match = text.match(/hoja:\s*(.+?)\s+celda:\s*([A-Z]+[0-9]+)\s+valor:\s*(.+)$/i);
+  if (!match) return null;
+  return {
+    sheetName: match[1].trim(),
+    cell: match[2].trim().toUpperCase(),
+    value: match[3].trim(),
+  };
 }
 
 function rowsToObjects(values, headerRowIndex) {
@@ -169,6 +193,36 @@ Hojas:
   return sanitizeTelegramText(response.choices[0].message.content || '');
 }
 
+async function analyzeImageWithOpenAI(imageUrl, caption = '') {
+  const systemPrompt = `
+Sos un analista financiero. Vas a leer comprobantes o datos de panel en una imagen.
+
+Tu tarea:
+- Extraer montos, fechas y conceptos claros.
+- Si hay datos incompletos, pedilos.
+- Responder sin markdown y sin * ni #.
+- Usar emojis para claridad.
+`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.1,
+    max_tokens: 500,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: `Contexto adicional: ${caption || 'sin texto'}` },
+          { type: 'image_url', image_url: { url: imageUrl } },
+        ],
+      },
+    ],
+  });
+
+  return sanitizeTelegramText(response.choices[0].message.content || '');
+}
+
 // Responde a cualquier mensaje de texto (sin comandos)
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
@@ -177,6 +231,16 @@ bot.on('message', async (msg) => {
   if (!text || text.startsWith('/')) return;
 
   try {
+    const writeRequest = parseWriteRequest(text);
+    if (writeRequest) {
+      await writeSheetValue(writeRequest.sheetName, writeRequest.cell, writeRequest.value);
+      const confirmMsg = sanitizeTelegramText(
+        `✅ Listo. Guardé en ${writeRequest.sheetName} ${writeRequest.cell} el valor ${writeRequest.value} 📌`
+      );
+      bot.sendMessage(chatId, confirmMsg);
+      return;
+    }
+
     pushHistory(chatId, 'user', text);
 
     const answer = await askChatGPT(chatId, text);
@@ -186,6 +250,37 @@ bot.on('message', async (msg) => {
   } catch (err) {
     console.error(err);
     bot.sendMessage(chatId, 'Error al consultar datos. Revisá logs.');
+  }
+});
+
+// Recibe fotos y las interpreta con OpenAI
+bot.on('photo', async (msg) => {
+  const chatId = msg.chat.id;
+  const caption = (msg.caption || '').trim();
+
+  try {
+    const photos = msg.photo || [];
+    if (!photos.length) return;
+
+    const fileId = photos[photos.length - 1].file_id;
+    const file = await bot.getFile(fileId);
+    const imageUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_TOKEN}/${file.file_path}`;
+
+    const writeRequest = parseWriteRequest(caption);
+    const analysis = await analyzeImageWithOpenAI(imageUrl, caption);
+
+    if (writeRequest) {
+      await writeSheetValue(writeRequest.sheetName, writeRequest.cell, writeRequest.value);
+      const confirmMsg = sanitizeTelegramText(
+        `✅ Listo. Guardé en ${writeRequest.sheetName} ${writeRequest.cell} el valor ${writeRequest.value} 📌`
+      );
+      bot.sendMessage(chatId, confirmMsg);
+    }
+
+    bot.sendMessage(chatId, analysis);
+  } catch (err) {
+    console.error(err);
+    bot.sendMessage(chatId, 'Error al analizar la imagen. Revisá logs.');
   }
 });
 
