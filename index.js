@@ -151,3 +151,20 @@ bot.on('message', async (msg) => {
 app.get('/', (req, res) => res.send('Bot activo'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server listo'));
+
+// Apagar polling al cerrar el proceso (evita 409 en deploys)
+process.on('SIGTERM', async () => {
+  try {
+    await bot.stopPolling();
+  } finally {
+    process.exit(0);
+  }
+});
+
+process.on('SIGINT', async () => {
+  try {
+    await bot.stopPolling();
+  } finally {
+    process.exit(0);
+  }
+});
