@@ -29,6 +29,52 @@ const SHEETS_CONFIG = [
   { name: 'TOTAL USDT', headerRow: 1, range: 'A:Z' },
 ];
 
+const RESUMEN_SHEET = 'RESUMEN DIARIO';
+const RESUMEN_COLUMNS = [
+  'FECHA',
+  'ARGENTUM_VENTA',
+  'ARGENTUM_DEPOSITOS',
+  'ARGENTUM_RETIROS',
+  'ARGENTUM_COMISION',
+  'ARGENTUM_NETO',
+  'IGNITE_ROYAL_VENTA',
+  'IGNITE_ROYAL_DEPOSITOS',
+  'IGNITE_ROYAL_RETIROS',
+  'IGNITE_ROYAL_COMISION',
+  'IGNITE_ROYAL_NETO',
+  'IGNITE_TRIBET_VENTA',
+  'IGNITE_TRIBET_DEPOSITOS',
+  'IGNITE_TRIBET_RETIROS',
+  'IGNITE_TRIBET_COMISION',
+  'IGNITE_TRIBET_NETO',
+  'TIGER_VENTA',
+  'TIGER_DEPOSITOS',
+  'TIGER_RETIROS',
+  'TIGER_COMISION',
+  'TIGER_NETO',
+  'MARSHALL_VENTA',
+  'MARSHALL_DEPOSITOS',
+  'MARSHALL_RETIROS',
+  'MARSHALL_COMISION',
+  'MARSHALL_NETO',
+  'TOTAL_NETO',
+  'TOTAL_A_BAJAR',
+  'BAJADO_REAL',
+  'PENDIENTE_A_BAJAR',
+  'PRESTAMOS_PEDIDOS',
+  'PRESTAMOS_DEVUELTOS',
+  'PRESTAMOS_PENDIENTES',
+  'OBSERVACIONES',
+];
+
+const TEAM_ORDER = [
+  { key: 'ARGENTUM', label: 'ARGENTUM' },
+  { key: 'IGNITE_ROYAL', label: 'IGNITE/ROYAL' },
+  { key: 'IGNITE_TRIBET', label: 'IGNITE/TRIBET' },
+  { key: 'TIGER', label: 'TIGER' },
+  { key: 'MARSHALL', label: 'MARSHALL' },
+];
+
 // Memoria por chat (RAM)
 const chatMemory = new Map();
 const MAX_HISTORY = 12; // 12 mensajes (6 user + 6 assistant)
@@ -58,6 +104,9 @@ const batchQueue = new Map();
 
 // Pendientes de escritura por confirmación
 const pendingWrites = new Map();
+
+// Sesiones de cierre
+const cierreSessions = new Map();
 
 function getSheetConfig(name) {
   return SHEETS_CONFIG.find((s) => s.name === name);
@@ -105,6 +154,88 @@ function logTokenCost({ status, inputTokens, outputTokens, costUsd, note }) {
     `[TOKENS] status=${status} input=${inputTokens} output=${outputTokens} ` +
     `cost_usd=${costUsd.toFixed(6)}${note ? ` note=${note}` : ''}`;
   console.log(msg);
+}
+
+function parseNumber(raw) {
+  if (raw === null || raw === undefined) return null;
+  const cleaned = String(raw)
+    .replace(/\./g, '')
+    .replace(/,/g, '.')
+    .replace(/[^\d.-]/g, '');
+  const parsed = Number(cleaned);
+  if (Number.isNaN(parsed)) return null;
+  return parsed;
+}
+
+function parseThreeNumbers(text) {
+  const nums = (text.match(/-?\d[\d.,]*/g) || []).map(parseNumber).filter((n) => n !== null);
+  if (nums.length < 3) return null;
+  return nums.slice(0, 3);
+}
+
+function parseTwoNumbers(text) {
+  const nums = (text.match(/-?\d[\d.,]*/g) || []).map(parseNumber).filter((n) => n !== null);
+  if (nums.length < 2) return null;
+  return nums.slice(0, 2);
+}
+
+function sanitizeTelegramText(text) {
+  return text.replace(/[*#]/g, '');
+}
+
+function safeJsonExtract(text) {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeDateValue(value) {
+  if (!value) return '';
+  const raw = String(value).trim();
+  if (!raw) return '';
+  return raw
+    .replace(/\./g, '/')
+    .replace(/-/g, '/')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+}
+
+function normalizeDateInput(value) {
+  const normalized = normalizeDateValue(value);
+  if (!normalized) return '';
+
+  const parts = normalized.split('/');
+  if (parts.length === 3) {
+    const [p1, p2, p3] = parts;
+    if (p1.length === 4) return `${p3.padStart(2, '0')}/${p2.padStart(2, '0')}/${p1}`;
+    if (p3.length === 4) return `${p1.padStart(2, '0')}/${p2.padStart(2, '0')}/${p3}`;
+  }
+  return normalized;
+}
+
+function extractDateFromText(text) {
+  const iso = text.match(/\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b/);
+  if (iso) return normalizeDateInput(iso[0]);
+
+  const dmy = text.match(/\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b/);
+  if (dmy) return normalizeDateInput(dmy[0]);
+
+  return '';
+}
+
+function columnIndexToLetter(index) {
+  let num = index + 1;
+  let letter = '';
+  while (num > 0) {
+    const mod = (num - 1) % 26;
+    letter = String.fromCharCode(65 + mod) + letter;
+    num = Math.floor((num - mod) / 26);
+  }
+  return letter;
 }
 
 async function getSheetValues(sheetName, range) {
@@ -164,6 +295,23 @@ async function writeSheetValue(sheetName, cell, value) {
     valueInputOption: 'USER_ENTERED',
     requestBody: {
       values: [[value]],
+    },
+  });
+}
+
+async function writeResumenRow(rowIndex, values) {
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+
+  const lastColumnLetter = columnIndexToLetter(RESUMEN_COLUMNS.length - 1);
+  const range = `${RESUMEN_SHEET}!A${rowIndex}:${lastColumnLetter}${rowIndex}`;
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [values],
     },
   });
 }
@@ -238,58 +386,9 @@ function pushHistory(chatId, role, content) {
   const history = getChatHistory(chatId);
   history.push({ role, content });
 
-  // Recortar historial si excede MAX_HISTORY
   if (history.length > MAX_HISTORY) {
     history.splice(0, history.length - MAX_HISTORY);
   }
-}
-
-function sanitizeTelegramText(text) {
-  return text.replace(/[*#]/g, '');
-}
-
-function safeJsonExtract(text) {
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) return null;
-  try {
-    return JSON.parse(match[0]);
-  } catch {
-    return null;
-  }
-}
-
-function normalizeDateValue(value) {
-  if (!value) return '';
-  const raw = String(value).trim();
-  if (!raw) return '';
-  return raw
-    .replace(/\./g, '/')
-    .replace(/-/g, '/')
-    .replace(/\s+/g, '')
-    .toLowerCase();
-}
-
-function normalizeDateInput(value) {
-  const normalized = normalizeDateValue(value);
-  if (!normalized) return '';
-
-  const parts = normalized.split('/');
-  if (parts.length === 3) {
-    const [p1, p2, p3] = parts;
-    if (p1.length === 4) return `${p1}/${p2.padStart(2, '0')}/${p3.padStart(2, '0')}`;
-    if (p3.length === 4) return `${p3}/${p2.padStart(2, '0')}/${p1.padStart(2, '0')}`;
-  }
-  return normalized;
-}
-
-function extractDateFromText(text) {
-  const iso = text.match(/\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b/);
-  if (iso) return normalizeDateInput(iso[0]);
-
-  const dmy = text.match(/\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b/);
-  if (dmy) return normalizeDateInput(dmy[0]);
-
-  return '';
 }
 
 async function findRowByDate(sheetName, dateStr) {
@@ -339,6 +438,243 @@ async function resolveCellByDate(sheetName, column, dateStr) {
   const row = await findRowByDate(sheetName, dateStr);
   if (!row) return null;
   return `${column}${row}`;
+}
+
+async function findResumenRowByDate(dateStr) {
+  const columnA = await getSheetValues(RESUMEN_SHEET, 'A:A');
+  const target = normalizeDateInput(dateStr);
+
+  for (let i = 1; i < columnA.length; i += 1) {
+    const cellValue = columnA[i]?.[0] ?? '';
+    const normalized = normalizeDateInput(cellValue);
+    if (normalized && normalized === target) {
+      return i + 1;
+    }
+  }
+  return null;
+}
+
+async function getNextResumenRow(dateStr) {
+  const existing = await findResumenRowByDate(dateStr);
+  if (existing) return existing;
+
+  const columnA = await getSheetValues(RESUMEN_SHEET, 'A:A');
+  for (let i = columnA.length - 1; i >= 1; i -= 1) {
+    if ((columnA[i]?.[0] || '').toString().trim() !== '') {
+      return i + 2;
+    }
+  }
+  return 2;
+}
+
+function buildResumenValues(summary) {
+  const values = [];
+  const push = (val) => values.push(val ?? '');
+
+  push(summary.fecha);
+
+  TEAM_ORDER.forEach((team) => {
+    const t = summary.teams[team.key];
+    push(t.venta);
+    push(t.depositos);
+    push(t.retiros);
+    push(t.comision);
+    push(t.neto);
+  });
+
+  push(summary.totalNeto);
+  push(summary.totalABajar);
+  push(summary.bajadoReal);
+  push(summary.pendienteABajar);
+  push(summary.prestamosPedidos);
+  push(summary.prestamosDevueltos);
+  push(summary.prestamosPendientes);
+  push(summary.observaciones);
+
+  return values;
+}
+
+function summarizeCierre(summary) {
+  const lines = [];
+  lines.push(`📅 Fecha: ${summary.fecha}`);
+  TEAM_ORDER.forEach((team) => {
+    const t = summary.teams[team.key];
+    lines.push(
+      `🎯 ${team.label}: Venta ${t.venta} | Depósitos ${t.depositos} | Retiros ${t.retiros} | Comisión ${t.comision} | Neto ${t.neto}`
+    );
+  });
+  lines.push(`💰 Total Neto: ${summary.totalNeto}`);
+  lines.push(`🏦 Total a Bajar: ${summary.totalABajar}`);
+  lines.push(`✅ Bajado Real: ${summary.bajadoReal}`);
+  lines.push(`⚠️ Pendiente a Bajar: ${summary.pendienteABajar}`);
+  lines.push(`🤝 Préstamos Pedidos: ${summary.prestamosPedidos}`);
+  lines.push(`🤝 Préstamos Devueltos: ${summary.prestamosDevueltos}`);
+  lines.push(`📌 Préstamos Pendientes: ${summary.prestamosPendientes}`);
+  if (summary.alertas.length) {
+    lines.push(`🚨 Alertas:`);
+    summary.alertas.forEach((a) => lines.push(`- ${a}`));
+  }
+  if (summary.observaciones) lines.push(`📝 Observaciones: ${summary.observaciones}`);
+  return lines.join('\n');
+}
+
+function startCierre(chatId) {
+  cierreSessions.set(chatId, {
+    step: 'fecha',
+    teamIndex: 0,
+    fecha: '',
+    teams: {},
+    prestamosPedidos: 0,
+    prestamosDevueltos: 0,
+    bajadoReal: 0,
+    observaciones: '',
+  });
+  bot.sendMessage(
+    chatId,
+    sanitizeTelegramText('📅 Iniciamos cierre. Pasame la fecha (dd/mm/aaaa o yyyy-mm-dd).')
+  );
+}
+
+async function handleCierreFlow(chatId, text) {
+  const session = cierreSessions.get(chatId);
+  if (!session) return false;
+
+  if (/cancelar cierre/i.test(text)) {
+    cierreSessions.delete(chatId);
+    bot.sendMessage(chatId, sanitizeTelegramText('❌ Cierre cancelado.'));
+    return true;
+  }
+
+  if (session.step === 'fecha') {
+    const date = extractDateFromText(text);
+    if (!date) {
+      bot.sendMessage(chatId, sanitizeTelegramText('⚠️ Necesito la fecha en formato dd/mm/aaaa.'));
+      return true;
+    }
+    session.fecha = date;
+    session.step = 'equipo';
+    const team = TEAM_ORDER[session.teamIndex];
+    bot.sendMessage(
+      chatId,
+      sanitizeTelegramText(
+        `🎯 ${team.label}: enviame Venta, Depósitos y Retiros. Ej: 1000000, 5000000, 2000000`
+      )
+    );
+    return true;
+  }
+
+  if (session.step === 'equipo') {
+    const numbers = parseThreeNumbers(text);
+    if (!numbers) {
+      bot.sendMessage(
+        chatId,
+        sanitizeTelegramText('⚠️ Formato inválido. Enviá 3 números: venta, depósitos, retiros.')
+      );
+      return true;
+    }
+    const [venta, depositos, retiros] = numbers;
+    const comision = Math.round(depositos * 0.015);
+    const neto = Math.round(venta + depositos - retiros - comision);
+
+    const team = TEAM_ORDER[session.teamIndex];
+    session.teams[team.key] = { venta, depositos, retiros, comision, neto };
+
+    session.teamIndex += 1;
+    if (session.teamIndex < TEAM_ORDER.length) {
+      const next = TEAM_ORDER[session.teamIndex];
+      bot.sendMessage(
+        chatId,
+        sanitizeTelegramText(
+          `🎯 ${next.label}: enviame Venta, Depósitos y Retiros. Ej: 1000000, 5000000, 2000000`
+        )
+      );
+      return true;
+    }
+
+    session.step = 'prestamos';
+    bot.sendMessage(
+      chatId,
+      sanitizeTelegramText('🤝 Préstamos: enviá pedidos y devueltos. Ej: 9000000, 3000000')
+    );
+    return true;
+  }
+
+  if (session.step === 'prestamos') {
+    const numbers = parseTwoNumbers(text);
+    if (!numbers) {
+      bot.sendMessage(
+        chatId,
+        sanitizeTelegramText('⚠️ Formato inválido. Enviá 2 números: pedidos, devueltos.')
+      );
+      return true;
+    }
+    session.prestamosPedidos = numbers[0];
+    session.prestamosDevueltos = numbers[1];
+    session.step = 'bajado';
+    bot.sendMessage(chatId, sanitizeTelegramText('🏦 ¿Cuánto se bajó real hoy?'));
+    return true;
+  }
+
+  if (session.step === 'bajado') {
+    const bajado = parseNumber(text);
+    if (bajado === null) {
+      bot.sendMessage(chatId, sanitizeTelegramText('⚠️ Enviá un número válido para bajado real.'));
+      return true;
+    }
+    session.bajadoReal = bajado;
+    session.step = 'observaciones';
+    bot.sendMessage(chatId, sanitizeTelegramText('📝 Observaciones del día (o "sin obs").'));
+    return true;
+  }
+
+  if (session.step === 'observaciones') {
+    session.observaciones = text.trim() || 'sin obs';
+
+    const totalNeto = TEAM_ORDER.reduce((sum, team) => sum + session.teams[team.key].neto, 0);
+    const totalABajar = totalNeto;
+    const pendienteABajar = Math.round(totalABajar - session.bajadoReal);
+    const prestamosPendientes = Math.round(session.prestamosPedidos - session.prestamosDevueltos);
+
+    const alertas = [];
+    if (pendienteABajar !== 0) {
+      alertas.push('El bajado real no coincide con el total a bajar.');
+    }
+    if (prestamosPendientes !== 0) {
+      alertas.push('Hay préstamos pendientes de devolución.');
+    }
+    if (totalNeto < 0) {
+      alertas.push('Total neto negativo: revisar balances por equipo.');
+    }
+
+    const summary = {
+      fecha: session.fecha,
+      teams: session.teams,
+      totalNeto,
+      totalABajar,
+      bajadoReal: session.bajadoReal,
+      pendienteABajar,
+      prestamosPedidos: session.prestamosPedidos,
+      prestamosDevueltos: session.prestamosDevueltos,
+      prestamosPendientes,
+      observaciones: session.observaciones,
+      alertas,
+    };
+
+    const rowIndex = await getNextResumenRow(summary.fecha);
+    const rowValues = buildResumenValues(summary);
+    await writeResumenRow(rowIndex, rowValues);
+
+    const resumenTexto = summarizeCierre(summary);
+    bot.sendMessage(
+      chatId,
+      sanitizeTelegramText(`✅ Cierre guardado en RESUMEN DIARIO (fila ${rowIndex}).\n\n${resumenTexto}`)
+    );
+
+    cierreSessions.delete(chatId);
+    return true;
+  }
+
+  return false;
 }
 
 async function askChatGPT(chatId, question, imageUrls = []) {
@@ -409,6 +745,7 @@ Reglas adicionales
 - Si el usuario aporta un dato, proponé cargarlo automáticamente en la celda correspondiente.
 - Podés escribir o borrar datos solo con autorización explícita del usuario.
 - Tenés acceso a valores y, cuando haya, fórmulas. Explicá el porqué del número si hay fórmula.
+- Si hay un faltante de dinero significativo, señalalo y sugerí en qué equipo revisar.
 
 Estilo:
 - No uses * ni #.
@@ -676,6 +1013,14 @@ bot.on('message', async (msg) => {
   const text = (msg.text || '').trim();
 
   if (!text || text.startsWith('/')) return;
+
+  if (/hacer cierre/i.test(text)) {
+    startCierre(chatId);
+    return;
+  }
+
+  const cierreHandled = await handleCierreFlow(chatId, text);
+  if (cierreHandled) return;
 
   try {
     const handled = await handleConfirmation(chatId, text);
