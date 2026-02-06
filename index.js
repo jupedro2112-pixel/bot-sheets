@@ -86,6 +86,16 @@ async function writeSheetValue(sheetName, cell, value) {
   });
 }
 
+async function deleteSheetValue(sheetName, cell) {
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: SHEET_ID,
+    range: `${sheetName}!${cell}`,
+  });
+}
+
 function parseWriteRequest(text) {
   const match = text.match(/hoja:\s*(.+?)\s+celda:\s*([A-Z]+[0-9]+)\s+valor:\s*(.+)$/i);
   if (!match) return null;
@@ -94,6 +104,18 @@ function parseWriteRequest(text) {
     cell: match[2].trim().toUpperCase(),
     value: match[3].trim(),
     source: 'texto',
+    action: 'write',
+  };
+}
+
+function parseDeleteRequest(text) {
+  const match = text.match(/borrar\s+hoja:\s*(.+?)\s+celda:\s*([A-Z]+[0-9]+)\s*$/i);
+  if (!match) return null;
+  return {
+    sheetName: match[1].trim(),
+    cell: match[2].trim().toUpperCase(),
+    source: 'texto',
+    action: 'delete',
   };
 }
 
@@ -253,6 +275,11 @@ Paso a paso del cierre diario
 9) Documentación
 - Resumir el cierre con totales, movimientos y observaciones.
 
+Reglas adicionales
+- Si falta un dato para cerrar correctamente, pedilo de forma clara.
+- Si el usuario aporta un dato, proponé cargarlo automáticamente en la celda correspondiente.
+- Podés escribir o borrar datos solo con autorización explícita del usuario.
+
 Tu tarea SIEMPRE es:
 1) Hacer un resumen general del estado global usando las formulas de las hojas.
 2) Responder la pregunta específica del usuario usando TODOS los datos.
@@ -320,10 +347,10 @@ Reglas:
 - La fecha del día está en columna A de "Detalle gral - Publi 1".
 
 Devolvé SOLO JSON con este formato:
-{"sheetName":"","cell":"","column":"","date":"","value":"","reason":""}
+{"sheetName":"","cell":"","column":"","date":"","value":"","reason":"","action":"write"}
 
 Si no es claro, devolvé:
-{"sheetName":"","cell":"","column":"","date":"","value":"","reason":"insuficiente"}
+{"sheetName":"","cell":"","column":"","date":"","value":"","reason":"insuficiente","action":"none"}
 `;
 
   const response = await openai.chat.completions.create({
@@ -353,8 +380,9 @@ Si no es claro, devolvé:
   const date = String(parsed.date || '').trim();
   const value = String(parsed.value || '').trim();
   const reason = String(parsed.reason || '').trim();
+  const action = String(parsed.action || 'write').trim();
 
-  if (!sheetName || !value) return null;
+  if (!sheetName || !value || action !== 'write') return null;
 
   return {
     sheetName,
@@ -364,6 +392,7 @@ Si no es claro, devolvé:
     value,
     source: 'imagen',
     reason,
+    action: 'write',
   };
 }
 
@@ -395,6 +424,9 @@ async function processBatch(chatId) {
     for (const t of batch.texts) {
       const wr = parseWriteRequest(t);
       if (wr) writeRequests.push(wr);
+
+      const dr = parseDeleteRequest(t);
+      if (dr) writeRequests.push(dr);
     }
 
     const imageSuggestion = await detectWriteFromImages(imageUrls, combinedText);
@@ -405,6 +437,7 @@ async function processBatch(chatId) {
           cell: imageSuggestion.cell,
           value: imageSuggestion.value,
           source: imageSuggestion.source,
+          action: 'write',
         });
       } else if (imageSuggestion.column && imageSuggestion.date) {
         const resolvedCell = await resolveCellByDate(
@@ -418,6 +451,7 @@ async function processBatch(chatId) {
             cell: resolvedCell,
             value: imageSuggestion.value,
             source: imageSuggestion.source,
+            action: 'write',
           });
         } else {
           unresolved.push(
@@ -434,16 +468,17 @@ async function processBatch(chatId) {
       pendingWrites.set(chatId, writeRequests);
 
       const details = writeRequests
-        .map(
-          (w, i) =>
-            `• ${i + 1}) Hoja ${w.sheetName} Celda ${w.cell} Valor ${w.value} (${w.source})`
-        )
+        .map((w, i) => {
+          const actionText = w.action === 'delete' ? 'BORRAR' : 'CARGAR';
+          const valueText = w.action === 'delete' ? 'vaciar' : w.value;
+          return `• ${i + 1}) ${actionText} Hoja ${w.sheetName} Celda ${w.cell} Valor ${valueText} (${w.source})`;
+        })
         .join('\n');
 
       confirmationBlock =
-        `📝 Detecté ${writeRequests.length} carga(s) para Sheets.\n` +
+        `📝 Detecté ${writeRequests.length} acción(es) para Sheets.\n` +
         `${details}\n` +
-        `✅ Respondé "confirmar" para guardar o "cancelar" para no guardar.\n\n`;
+        `✅ Respondé "confirmar" para ejecutar o "cancelar" para no hacer cambios.\n\n`;
     }
 
     const unresolvedBlock = unresolved.length ? `${unresolved.join('\n')}\n\n` : '';
@@ -470,16 +505,20 @@ async function handleConfirmation(chatId, text) {
   const lower = text.toLowerCase();
   if (['confirmar', 'si', 'sí', 'ok', 'dale'].includes(lower)) {
     for (const wr of pending) {
-      await writeSheetValue(wr.sheetName, wr.cell, wr.value);
+      if (wr.action === 'delete') {
+        await deleteSheetValue(wr.sheetName, wr.cell);
+      } else {
+        await writeSheetValue(wr.sheetName, wr.cell, wr.value);
+      }
     }
     pendingWrites.delete(chatId);
-    bot.sendMessage(chatId, sanitizeTelegramText('✅ Listo. Guardé los datos en Sheets 📌'));
+    bot.sendMessage(chatId, sanitizeTelegramText('✅ Listo. Cambios aplicados en Sheets 📌'));
     return true;
   }
 
   if (['cancelar', 'no', 'stop'].includes(lower)) {
     pendingWrites.delete(chatId);
-    bot.sendMessage(chatId, sanitizeTelegramText('❌ Cancelado. No guardé nada.'));
+    bot.sendMessage(chatId, sanitizeTelegramText('❌ Cancelado. No hice cambios.'));
     return true;
   }
 
