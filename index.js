@@ -80,7 +80,6 @@ function pushHistory(chatId, role, content) {
   const history = getChatHistory(chatId);
   history.push({ role, content });
 
-  // Recortar historial si excede MAX_HISTORY
   if (history.length > MAX_HISTORY) {
     history.splice(0, history.length - MAX_HISTORY);
   }
@@ -114,17 +113,19 @@ Hojas:
 
   const history = getChatHistory(chatId);
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.2,
-    messages: [
+  const response = await openai.responses.create({
+    model: 'gpt-5.2-pro',
+    input: [
       { role: 'system', content: systemPrompt },
       ...history,
-      { role: 'user', content: `Datos completos:\n${JSON.stringify(data)}\n\nPregunta: ${question}` },
+      {
+        role: 'user',
+        content: `Datos completos:\n${JSON.stringify(data)}\n\nPregunta: ${question}`,
+      },
     ],
   });
 
-  return response.choices[0].message.content;
+  return response.output_text;
 }
 
 // Responde a cualquier mensaje de texto (sin comandos)
