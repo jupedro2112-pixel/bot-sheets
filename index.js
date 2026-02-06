@@ -8,6 +8,10 @@ const app = express();
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+/* ================= CONFIG OPENAI ================= */
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const MAX_OUTPUT_TOKENS = 450;
+
 /* ================= GOOGLE AUTH ================= */
 
 const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
@@ -32,12 +36,13 @@ const SHEETS_CONFIG = [
 /* ================= MEMORIA CHAT ================= */
 
 const chatMemory = new Map();
-const MAX_HISTORY = 10;
+const MAX_HISTORY = 8;
 
-/* ================= CACHE Y ESTADO ================= */
+/* ================= CACHE ================= */
 
-let lastSummary = null;
-let lastSheetsHash = null;
+let cachedSummary = null;
+let cachedAt = 0;
+const SUMMARY_TTL_MS = 60 * 1000; // 1 minuto
 
 /* ================= HELPERS ================= */
 
@@ -75,9 +80,38 @@ async function loadAllSheets() {
   return allData;
 }
 
+function parseNumber(value) {
+  if (value == null) return 0;
+  const cleaned = String(value)
+    .replace(/\./g, '')
+    .replace(',', '.')
+    .replace(/[^\d.-]/g, '');
+  const num = Number(cleaned);
+  return Number.isFinite(num) ? num : 0;
+}
+
+function findFirstValue(row, possibleKeys) {
+  for (const key of possibleKeys) {
+    if (row[key] != null && row[key] !== '') return row[key];
+  }
+  return null;
+}
+
+function extractDayOfMonth(text) {
+  const match = text.match(/día\s+(\d{1,2})/i);
+  return match ? Number(match[1]) : null;
+}
+
+function parseDateToDay(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (!Number.isNaN(d.getTime())) return d.getDate();
+  return null;
+}
+
 /* ================= FINANCIAL ENGINE ================= */
 
-function buildFinancialSummary(data) {
+function buildFinancialSummary(data, question) {
   const summary = {
     fecha: new Date().toISOString().slice(0, 10),
     resumen_global: {
@@ -89,22 +123,41 @@ function buildFinancialSummary(data) {
     alertas: [],
   };
 
+  const dayRequested = extractDayOfMonth(question);
+
+  const MONTO_KEYS = ['monto', 'Monto', 'IMPORTE', 'Importe', 'Total', 'total'];
+  const TIPO_KEYS = ['tipo', 'Tipo', 'MOVIMIENTO', 'Movimiento'];
+  const FECHA_KEYS = ['fecha', 'Fecha', 'Día', 'Dia'];
+
   for (const [sheet, rows] of Object.entries(data)) {
     let ingresos = 0;
     let egresos = 0;
+    let movimientos = 0;
 
     rows.forEach(r => {
-      const monto = Number(r.monto || r.Monto || 0);
-      const tipo = (r.tipo || r.Tipo || '').toLowerCase();
-      if (tipo === 'ingreso') ingresos += monto;
-      if (tipo === 'egreso') egresos += monto;
+      if (dayRequested) {
+        const fechaVal = findFirstValue(r, FECHA_KEYS);
+        const day = parseDateToDay(fechaVal);
+        if (day != null && day !== dayRequested) return;
+      }
+
+      const montoVal = findFirstValue(r, MONTO_KEYS);
+      const tipoVal = findFirstValue(r, TIPO_KEYS);
+
+      const monto = parseNumber(montoVal);
+      const tipo = String(tipoVal || '').toLowerCase();
+
+      if (monto || tipo) movimientos++;
+
+      if (tipo.includes('ingreso')) ingresos += monto;
+      if (tipo.includes('egreso') || tipo.includes('retiro') || tipo.includes('baja')) egresos += monto;
     });
 
     summary.por_equipo[sheet] = {
       ingresos,
       egresos,
       pendiente: ingresos - egresos,
-      movimientos: rows.length,
+      movimientos,
     };
 
     summary.resumen_global.total_ingresos += ingresos;
@@ -120,7 +173,6 @@ function buildFinancialSummary(data) {
 
 function detectChanges(prev, curr) {
   if (!prev) return [];
-
   const alerts = [];
 
   if (prev.resumen_global.resultado !== curr.resumen_global.resultado) {
@@ -131,14 +183,12 @@ function detectChanges(prev, curr) {
 
   for (const team of Object.keys(curr.por_equipo)) {
     if (!prev.por_equipo[team]) continue;
-
     const p = prev.por_equipo[team];
     const c = curr.por_equipo[team];
 
     if (p.pendiente !== c.pendiente) {
       alerts.push(`${team}: pendiente ${p.pendiente} → ${c.pendiente}`);
     }
-
     if (p.movimientos !== c.movimientos) {
       alerts.push(`${team}: movimientos ${p.movimientos} → ${c.movimientos}`);
     }
@@ -163,11 +213,18 @@ function pushHistory(chatId, role, content) {
 }
 
 async function askChatGPT(chatId, question) {
-  const data = await loadAllSheets();
-  const summary = buildFinancialSummary(data);
+  const now = Date.now();
+  let summary;
 
-  summary.alertas = detectChanges(lastSummary, summary);
-  lastSummary = summary;
+  if (cachedSummary && now - cachedAt < SUMMARY_TTL_MS) {
+    summary = cachedSummary;
+  } else {
+    const data = await loadAllSheets();
+    summary = buildFinancialSummary(data, question);
+    summary.alertas = detectChanges(cachedSummary, summary);
+    cachedSummary = summary;
+    cachedAt = now;
+  }
 
   const systemPrompt = `
 Sos un analista financiero profesional.
@@ -180,7 +237,8 @@ Tu tarea es:
   const history = getChatHistory(chatId);
 
   const response = await openai.responses.create({
-    model: 'gpt-5.2-pro',
+    model: OPENAI_MODEL,
+    max_output_tokens: MAX_OUTPUT_TOKENS,
     input: [
       { role: 'system', content: systemPrompt },
       ...history,
@@ -195,6 +253,15 @@ Tu tarea es:
 }
 
 /* ================= TELEGRAM ================= */
+
+// Limpia cualquier webhook previo (evita conflicto con polling)
+(async () => {
+  try {
+    await bot.deleteWebhook({ drop_pending_updates: true });
+  } catch (err) {
+    console.error('Error deleteWebhook:', err);
+  }
+})();
 
 bot.on('message', async msg => {
   const chatId = msg.chat.id;
@@ -217,3 +284,22 @@ bot.on('message', async msg => {
 app.get('/', (_, res) => res.send('Bot financiero activo'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor listo'));
+
+/* ================= SHUTDOWN ================= */
+
+// Apaga polling al cerrar el proceso (evita 409 en deploys)
+process.on('SIGTERM', async () => {
+  try {
+    await bot.stopPolling();
+  } finally {
+    process.exit(0);
+  }
+});
+
+process.on('SIGINT', async () => {
+  try {
+    await bot.stopPolling();
+  } finally {
+    process.exit(0);
+  }
+});
