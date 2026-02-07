@@ -96,7 +96,6 @@ function parseNumber(raw) {
   let normalized = cleaned;
 
   if (hasComma && hasDot) {
-    // Formato miles con punto y decimales con coma
     normalized = cleaned.replace(/\./g, '').replace(/,/g, '.');
   } else if (hasComma) {
     const last = cleaned.lastIndexOf(',');
@@ -286,13 +285,14 @@ async function analyzeImages(imageUrls, caption = '') {
   const systemPrompt = `
 Sos un extractor de datos financieros de imágenes.
 Para cada imagen, identificá si es:
-1) Panel de casino: devuelve depositos, retiros y venta (si aparece).
-2) Comprobante de bajado: devuelve monto transferido.
+1) Panel de casino: devuelve depositos, retiros y venta (si aparece), y la fecha.
+2) Comprobante de bajado: devuelve monto transferido y la fecha.
 
 Devolvé SOLO JSON en este formato:
-{"items":[{"type":"panel","depositos":0,"retiros":0,"venta":0},{"type":"bajado","monto":0}]}
+{"items":[{"type":"panel","depositos":0,"retiros":0,"venta":0,"fecha":""},{"type":"bajado","monto":0,"fecha":""}]}
 
 Si un dato no está, usá null.
+La fecha puede venir como "01/02/2026" o "2026-02-01".
 `;
 
   const response = await openai.chat.completions.create({
@@ -320,8 +320,12 @@ Si un dato no está, usá null.
   let panelRetiros = 0;
   let panelCount = 0;
   let bajadoTotal = 0;
+  const fechas = [];
 
   items.forEach((item) => {
+    const fecha = normalizeDateInput(item.fecha || '');
+    if (fecha) fechas.push(fecha);
+
     if (item.type === 'panel') {
       const dep = parseNumber(item.depositos);
       const ret = parseNumber(item.retiros);
@@ -343,6 +347,7 @@ Si un dato no está, usá null.
   return {
     panel: panelData,
     bajadoTotal: bajadoTotal > 0 ? bajadoTotal : null,
+    fechas,
   };
 }
 
@@ -621,6 +626,19 @@ async function processBatch(chatId) {
   let imageData = null;
   if (imageUrls.length) {
     imageData = await analyzeImages(imageUrls, text);
+  }
+
+  if (session && imageData?.fechas?.length) {
+    const mismatch = imageData.fechas.some((f) => f !== session.fecha);
+    if (mismatch) {
+      bot.sendMessage(
+        chatId,
+        sanitizeTelegramText(
+          `⚠️ La fecha de las fotos no coincide con el cierre (${session.fecha}). Enviá solo comprobantes/paneles de ese día.`
+        )
+      );
+      return;
+    }
   }
 
   if (session) {
