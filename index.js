@@ -86,11 +86,37 @@ function parseNumber(raw) {
   if (raw === null || raw === undefined) return null;
   const text = String(raw).trim();
   if (!text) return null;
-  const cleaned = text
-    .replace(/\./g, '')
-    .replace(/,/g, '.')
-    .replace(/[^\d.-]/g, '');
-  const parsed = Number(cleaned);
+
+  const cleaned = text.replace(/[^\d.,-]/g, '');
+  if (!cleaned) return null;
+
+  const hasComma = cleaned.includes(',');
+  const hasDot = cleaned.includes('.');
+
+  let normalized = cleaned;
+
+  if (hasComma && hasDot) {
+    // Formato miles con punto y decimales con coma
+    normalized = cleaned.replace(/\./g, '').replace(/,/g, '.');
+  } else if (hasComma) {
+    const last = cleaned.lastIndexOf(',');
+    const decimals = cleaned.length - last - 1;
+    if (decimals === 2) {
+      normalized = cleaned.replace(/\./g, '').replace(/,/g, '.');
+    } else {
+      normalized = cleaned.replace(/,/g, '');
+    }
+  } else if (hasDot) {
+    const last = cleaned.lastIndexOf('.');
+    const decimals = cleaned.length - last - 1;
+    if (decimals === 2) {
+      normalized = cleaned.replace(/,/g, '');
+    } else {
+      normalized = cleaned.replace(/\./g, '');
+    }
+  }
+
+  const parsed = Number(normalized);
   if (Number.isNaN(parsed)) return null;
   return parsed;
 }
