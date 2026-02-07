@@ -74,9 +74,11 @@ const TEAM_ORDER = [
 
 const cierreSessions = new Map();
 
-// Batch 5 segundos
 const BATCH_WINDOW_MS = 5000;
 const batchQueue = new Map();
+
+const MAX_INT_DIGITS = 12;
+const MAX_VALUE = 1e12;
 
 function sanitizeTelegramText(text) {
   return text.replace(/[*#]/g, '');
@@ -84,6 +86,8 @@ function sanitizeTelegramText(text) {
 
 function parseNumber(raw) {
   if (raw === null || raw === undefined) return null;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+
   const text = String(raw).trim();
   if (!text) return null;
 
@@ -115,9 +119,17 @@ function parseNumber(raw) {
     }
   }
 
+  const match = normalized.match(/^-?\d+(\.\d+)?$/);
+  if (!match) return null;
+
+  const intPart = match[0].split('.')[0].replace('-', '');
+  if (intPart.length > MAX_INT_DIGITS) return null;
+
   const parsed = Number(normalized);
-  if (Number.isNaN(parsed)) return null;
-  return parsed;
+  if (!Number.isFinite(parsed)) return null;
+  if (Math.abs(parsed) > MAX_VALUE) return null;
+
+  return Math.round(parsed * 100) / 100;
 }
 
 function formatNumberES(value) {
@@ -126,12 +138,6 @@ function formatNumberES(value) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(value);
-}
-
-function parseThreeNumbers(text) {
-  const nums = (text.match(/-?\d[\d.,]*/g) || []).map(parseNumber).filter((n) => n !== null);
-  if (nums.length < 3) return null;
-  return nums.slice(0, 3);
 }
 
 function parseTwoNumbers(text) {
@@ -167,9 +173,11 @@ function normalizeDateInput(value) {
 
   const parts = normalized.split('/');
   if (parts.length === 3) {
-    const [p1, p2, p3] = parts;
+    let [p1, p2, p3] = parts;
+
     if (p1.length === 4) return `${p3.padStart(2, '0')}/${p2.padStart(2, '0')}/${p1}`;
     if (p3.length === 4) return `${p1.padStart(2, '0')}/${p2.padStart(2, '0')}/${p3}`;
+    if (p3.length === 2) return `${p1.padStart(2, '0')}/${p2.padStart(2, '0')}/20${p3}`;
   }
   return normalized;
 }
@@ -279,36 +287,30 @@ async function getPendingFromPreviousDay(dateStr) {
   return 0;
 }
 
-async function analyzeImages(imageUrls, caption = '') {
-  if (!imageUrls.length) return null;
-
+async function analyzeSingleImage(imageUrl, caption = '') {
   const systemPrompt = `
-Sos un extractor de datos financieros de imágenes.
-Procesá cada imagen por separado, sin mezclar montos entre imágenes.
+Extraé datos financieros de UNA SOLA imagen.
+Devolvé SOLO JSON:
+{"type":"panel","depositos":"","retiros":"","fecha":""}
+o
+{"type":"bajado","monto_texto":"","fecha":""}
+o
+{"type":"none"}
 
-Devolvé SOLO JSON con este formato:
-{
-  "items": [
-    {"type":"panel","depositos":0,"retiros":0,"fecha":""},
-    {"type":"bajado","monto":0,"fecha":""}
-  ]
-}
-
-Si un dato no está, usá null.
 La fecha puede venir como "01/02/2026" o "2026-02-01".
 `;
 
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     temperature: 0,
-    max_tokens: 500,
+    max_tokens: 300,
     messages: [
       { role: 'system', content: systemPrompt },
       {
         role: 'user',
         content: [
           { type: 'text', text: `Contexto: ${caption || 'sin texto'}` },
-          ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
+          { type: 'image_url', image_url: { url: imageUrl } },
         ],
       },
     ],
@@ -316,15 +318,23 @@ La fecha puede venir como "01/02/2026" o "2026-02-01".
 
   const raw = response.choices[0].message.content || '';
   const parsed = safeJsonExtract(raw);
-  const items = parsed?.items || (Array.isArray(parsed) ? parsed : null);
-  if (!Array.isArray(items)) return null;
+  if (!parsed || !parsed.type) return null;
+  return parsed;
+}
+
+async function analyzeImages(imageUrls, caption = '') {
+  if (!imageUrls.length) return null;
 
   const fechasPanel = [];
   const fechasBajado = [];
   const panelItems = [];
   const bajadoItems = [];
+  let bajadoInvalidCount = 0;
 
-  items.forEach((item) => {
+  for (const imageUrl of imageUrls) {
+    const item = await analyzeSingleImage(imageUrl, caption);
+    if (!item || item.type === 'none') continue;
+
     const fecha = normalizeDateInput(item.fecha || '');
     if (item.type === 'panel' && fecha) fechasPanel.push(fecha);
     if (item.type === 'bajado' && fecha) fechasBajado.push(fecha);
@@ -336,10 +346,15 @@ La fecha puede venir como "01/02/2026" o "2026-02-01".
         panelItems.push({ depositos: dep ?? 0, retiros: ret ?? 0 });
       }
     } else if (item.type === 'bajado') {
-      const monto = parseNumber(item.monto);
-      if (monto !== null) bajadoItems.push(monto);
+      const montoRaw = item.monto_texto || item.monto;
+      const monto = parseNumber(montoRaw);
+      if (monto !== null) {
+        bajadoItems.push(monto);
+      } else {
+        bajadoInvalidCount += 1;
+      }
     }
-  });
+  }
 
   let panelData = null;
   if (panelItems.length > 0) {
@@ -358,6 +373,8 @@ La fecha puede venir como "01/02/2026" o "2026-02-01".
     bajadoTotal,
     fechasPanel,
     fechasBajado,
+    bajadoItemsCount: bajadoItems.length,
+    bajadoInvalidCount,
   };
 }
 
@@ -634,7 +651,21 @@ async function processBatch(chatId) {
 
   if (session && imageData) {
     const fechasBajado = imageData.fechasBajado || [];
-    if (fechasBajado.length) {
+    if (imageData.bajadoInvalidCount > 0) {
+      bot.sendMessage(
+        chatId,
+        sanitizeTelegramText('⚠️ No pude leer uno o más montos de comprobantes. Reenviá las fotos.')
+      );
+      return;
+    }
+    if (imageData.bajadoItemsCount > 0) {
+      if (fechasBajado.length !== imageData.bajadoItemsCount) {
+        bot.sendMessage(
+          chatId,
+          sanitizeTelegramText('⚠️ No pude leer la fecha de uno o más comprobantes. Reenviá las fotos.')
+        );
+        return;
+      }
       const mismatch = fechasBajado.some((f) => f !== session.fecha);
       if (mismatch) {
         bot.sendMessage(
@@ -666,7 +697,6 @@ async function processBatch(chatId) {
   }
 }
 
-// Responde a cualquier mensaje de texto (sin comandos)
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
@@ -674,7 +704,6 @@ bot.on('message', async (msg) => {
   enqueueBatch(chatId, { text });
 });
 
-// Recibe fotos y las interpreta
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
   const caption = (msg.caption || '').trim();
