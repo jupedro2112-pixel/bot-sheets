@@ -284,12 +284,15 @@ async function analyzeImages(imageUrls, caption = '') {
 
   const systemPrompt = `
 Sos un extractor de datos financieros de imágenes.
-Para cada imagen, identificá si es:
-1) Panel de casino: devuelve depositos, retiros y venta (si aparece), y la fecha.
-2) Comprobante de bajado: devuelve monto transferido y la fecha.
+Procesá cada imagen por separado, sin mezclar montos entre imágenes.
 
-Devolvé SOLO JSON en este formato:
-{"items":[{"type":"panel","depositos":0,"retiros":0,"venta":0,"fecha":""},{"type":"bajado","monto":0,"fecha":""}]}
+Devolvé SOLO JSON con este formato:
+{
+  "items": [
+    {"type":"panel","depositos":0,"retiros":0,"fecha":""},
+    {"type":"bajado","monto":0,"fecha":""}
+  ]
+}
 
 Si un dato no está, usá null.
 La fecha puede venir como "01/02/2026" o "2026-02-01".
@@ -316,11 +319,9 @@ La fecha puede venir como "01/02/2026" o "2026-02-01".
   const items = parsed?.items || (Array.isArray(parsed) ? parsed : null);
   if (!Array.isArray(items)) return null;
 
-  let panelDeposit = 0;
-  let panelRetiros = 0;
-  let panelCount = 0;
-  let bajadoTotal = 0;
   const fechas = [];
+  const panelItems = [];
+  const bajadoItems = [];
 
   items.forEach((item) => {
     const fecha = normalizeDateInput(item.fecha || '');
@@ -329,24 +330,30 @@ La fecha puede venir como "01/02/2026" o "2026-02-01".
     if (item.type === 'panel') {
       const dep = parseNumber(item.depositos);
       const ret = parseNumber(item.retiros);
-      if (dep !== null) panelDeposit += dep;
-      if (ret !== null) panelRetiros += ret;
-      panelCount += 1;
+      if (dep !== null || ret !== null) {
+        panelItems.push({ depositos: dep ?? 0, retiros: ret ?? 0 });
+      }
     } else if (item.type === 'bajado') {
       const monto = parseNumber(item.monto);
-      if (monto !== null) bajadoTotal += monto;
+      if (monto !== null) bajadoItems.push(monto);
     }
   });
 
   let panelData = null;
-  if (panelCount > 0) {
+  if (panelItems.length > 0) {
+    const panelDeposit = panelItems.reduce((sum, p) => sum + p.depositos, 0);
+    const panelRetiros = panelItems.reduce((sum, p) => sum + p.retiros, 0);
     const ventaFinal = panelDeposit - panelRetiros;
     panelData = { venta: ventaFinal, depositos: panelDeposit, retiros: panelRetiros };
   }
 
+  const bajadoTotal = bajadoItems.length
+    ? bajadoItems.reduce((sum, v) => sum + v, 0)
+    : null;
+
   return {
     panel: panelData,
-    bajadoTotal: bajadoTotal > 0 ? bajadoTotal : null,
+    bajadoTotal,
     fechas,
   };
 }
@@ -483,7 +490,7 @@ async function handleCierreFlow(chatId, text) {
     session.step = 'prestamos';
     bot.sendMessage(
       chatId,
-      sanitizeTelegramText('🤝 Préstamos: enviá pedidos y devueltos. Ej: 9000000, 3000000')
+      sanitizeTelegramText('🤝 Préstamos: envi�� pedidos y devueltos. Ej: 9000000, 3000000')
     );
     return true;
   }
