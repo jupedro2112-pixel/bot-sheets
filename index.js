@@ -319,13 +319,15 @@ La fecha puede venir como "01/02/2026" o "2026-02-01".
   const items = parsed?.items || (Array.isArray(parsed) ? parsed : null);
   if (!Array.isArray(items)) return null;
 
-  const fechas = [];
+  const fechasPanel = [];
+  const fechasBajado = [];
   const panelItems = [];
   const bajadoItems = [];
 
   items.forEach((item) => {
     const fecha = normalizeDateInput(item.fecha || '');
-    if (fecha) fechas.push(fecha);
+    if (item.type === 'panel' && fecha) fechasPanel.push(fecha);
+    if (item.type === 'bajado' && fecha) fechasBajado.push(fecha);
 
     if (item.type === 'panel') {
       const dep = parseNumber(item.depositos);
@@ -354,7 +356,8 @@ La fecha puede venir como "01/02/2026" o "2026-02-01".
   return {
     panel: panelData,
     bajadoTotal,
-    fechas,
+    fechasPanel,
+    fechasBajado,
   };
 }
 
@@ -461,10 +464,7 @@ async function handleCierreFlow(chatId, text) {
   if (session.step === 'equipo') {
     const numbers = parseTwoNumbers(text);
     if (!numbers) {
-      bot.sendMessage(
-        chatId,
-        sanitizeTelegramText('⚠️ Formato inválido. Enviá 2 números: depósitos, retiros.')
-      );
+      bot.sendMessage(chatId, sanitizeTelegramText('⚠️ Formato inválido. Enviá 2 números: depósitos, retiros.'));
       return true;
     }
     const [depositos, retiros] = numbers;
@@ -632,15 +632,15 @@ async function processBatch(chatId) {
     imageData = await analyzeImages(imageUrls, text);
   }
 
-  if (session && imageData?.fechas?.length) {
-    const fechasValidas = imageData.fechas.filter((f) => f);
-    if (fechasValidas.length) {
-      const match = fechasValidas.some((f) => f === session.fecha);
-      if (!match) {
+  if (session && imageData) {
+    const fechasBajado = imageData.fechasBajado || [];
+    if (fechasBajado.length) {
+      const mismatch = fechasBajado.some((f) => f !== session.fecha);
+      if (mismatch) {
         bot.sendMessage(
           chatId,
           sanitizeTelegramText(
-            `⚠️ La fecha de las fotos no coincide con el cierre (${session.fecha}). Enviá solo comprobantes/paneles de ese día.`
+            `⚠️ La fecha de los comprobantes no coincide con el cierre (${session.fecha}). Enviá solo comprobantes de ese día.`
           )
         );
         return;
