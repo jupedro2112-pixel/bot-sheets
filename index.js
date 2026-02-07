@@ -490,7 +490,7 @@ async function handleCierreFlow(chatId, text) {
     session.step = 'prestamos';
     bot.sendMessage(
       chatId,
-      sanitizeTelegramText('🤝 Préstamos: envi�� pedidos y devueltos. Ej: 9000000, 3000000')
+      sanitizeTelegramText('🤝 Préstamos: enviá pedidos y devueltos. Ej: 9000000, 3000000')
     );
     return true;
   }
@@ -498,10 +498,7 @@ async function handleCierreFlow(chatId, text) {
   if (session.step === 'prestamos') {
     const numbers = parseTwoNumbers(text);
     if (!numbers) {
-      bot.sendMessage(
-        chatId,
-        sanitizeTelegramText('⚠️ Formato inválido. Enviá 2 números: pedidos, devueltos.')
-      );
+      bot.sendMessage(chatId, sanitizeTelegramText('⚠️ Formato inválido. Enviá 2 números: pedidos, devueltos.'));
       return true;
     }
     session.prestamosPedidos = numbers[0];
@@ -636,15 +633,18 @@ async function processBatch(chatId) {
   }
 
   if (session && imageData?.fechas?.length) {
-    const mismatch = imageData.fechas.some((f) => f !== session.fecha);
-    if (mismatch) {
-      bot.sendMessage(
-        chatId,
-        sanitizeTelegramText(
-          `⚠️ La fecha de las fotos no coincide con el cierre (${session.fecha}). Enviá solo comprobantes/paneles de ese día.`
-        )
-      );
-      return;
+    const fechasValidas = imageData.fechas.filter((f) => f);
+    if (fechasValidas.length) {
+      const match = fechasValidas.some((f) => f === session.fecha);
+      if (!match) {
+        bot.sendMessage(
+          chatId,
+          sanitizeTelegramText(
+            `⚠️ La fecha de las fotos no coincide con el cierre (${session.fecha}). Enviá solo comprobantes/paneles de ese día.`
+          )
+        );
+        return;
+      }
     }
   }
 
@@ -662,10 +662,7 @@ async function processBatch(chatId) {
   }
 
   if (!session && combinedText) {
-    bot.sendMessage(
-      chatId,
-      sanitizeTelegramText('Usá "hacer cierre" para iniciar el cierre diario paso a paso.')
-    );
+    bot.sendMessage(chatId, sanitizeTelegramText('Usá "hacer cierre" para iniciar el cierre diario paso a paso.'));
   }
 }
 
