@@ -86,7 +86,13 @@ function sanitizeTelegramText(text) {
 
 function parseNumber(raw) {
   if (raw === null || raw === undefined) return null;
-  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const n = raw;
+    const intPart = Math.trunc(Math.abs(n)).toString();
+    if (intPart.length > MAX_INT_DIGITS) return null;
+    if (Math.abs(n) > MAX_VALUE) return null;
+    return Math.round(n * 100) / 100;
+  }
 
   const text = String(raw).trim();
   if (!text) return null;
@@ -182,6 +188,35 @@ function normalizeDateInput(value) {
   return normalized;
 }
 
+function getDateCandidates(value) {
+  const normalized = normalizeDateValue(value);
+  if (!normalized) return [];
+  const parts = normalized.split('/');
+  if (parts.length !== 3) return [];
+
+  let [p1, p2, p3] = parts;
+  let year = '';
+
+  if (p1.length === 4) year = p1;
+  else if (p3.length === 4) year = p3;
+  else if (p3.length === 2) year = `20${p3}`;
+  else return [];
+
+  const day = p1.length === 4 ? p3 : p1;
+  const month = p2;
+
+  const candidates = new Set();
+  const cand1 = `${day.padStart(2, '0')}/${month.padStart(2, '0')}/${year}`;
+  candidates.add(cand1);
+
+  if (Number(day) <= 12 && Number(month) <= 12) {
+    const cand2 = `${month.padStart(2, '0')}/${day.padStart(2, '0')}/${year}`;
+    candidates.add(cand2);
+  }
+
+  return Array.from(candidates);
+}
+
 function extractDateFromText(text) {
   const iso = text.match(/\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b/);
   if (iso) return normalizeDateInput(iso[0]);
@@ -190,6 +225,24 @@ function extractDateFromText(text) {
   if (dmy) return normalizeDateInput(dmy[0]);
 
   return '';
+}
+
+function normalizeId(value) {
+  if (!value) return '';
+  return String(value).replace(/\s+/g, '').toLowerCase();
+}
+
+function extractComprobanteId(item, fallback) {
+  const id =
+    item.comprobante_id ||
+    item.coelsa_id ||
+    item.operacion_id ||
+    item.id ||
+    item.referencia ||
+    '';
+  const normalized = normalizeId(id);
+  if (normalized) return normalized;
+  return fallback ? normalizeId(fallback) : '';
 }
 
 function columnIndexToLetter(index) {
@@ -291,13 +344,14 @@ async function analyzeSingleImage(imageUrl, caption = '') {
   const systemPrompt = `
 Extraé datos financieros de UNA SOLA imagen.
 Devolvé SOLO JSON:
-{"type":"panel","depositos":"","retiros":"","fecha":""}
+{"type":"panel","depositos_texto":"","retiros_texto":"","fecha_texto":""}
 o
-{"type":"bajado","monto_texto":"","fecha":""}
+{"type":"bajado","monto_texto":"","fecha_texto":"","comprobante_id":"","coelsa_id":"","operacion_id":""}
 o
 {"type":"none"}
 
 La fecha puede venir como "01/02/2026" o "2026-02-01".
+Si hay más de un monto, devolvé el monto total transferido.
 `;
 
   const response = await openai.chat.completions.create({
@@ -322,34 +376,51 @@ La fecha puede venir como "01/02/2026" o "2026-02-01".
   return parsed;
 }
 
+async function analyzeSingleImageWithRetry(imageUrl, caption = '') {
+  const first = await analyzeSingleImage(imageUrl, caption);
+  if (!first) return null;
+
+  const needsRetry =
+    (first.type === 'bajado' && (!first.monto_texto || !first.fecha_texto)) ||
+    (first.type === 'panel' && (!first.depositos_texto || !first.retiros_texto));
+
+  if (!needsRetry) return first;
+
+  const second = await analyzeSingleImage(imageUrl, caption);
+  if (!second) return first;
+
+  return second;
+}
+
 async function analyzeImages(imageUrls, caption = '') {
   if (!imageUrls.length) return null;
 
-  const fechasPanel = [];
-  const fechasBajado = [];
+  const panelDatesRaw = [];
+  const bajadoItemsDetailed = [];
   const panelItems = [];
-  const bajadoItems = [];
   let bajadoInvalidCount = 0;
 
   for (const imageUrl of imageUrls) {
-    const item = await analyzeSingleImage(imageUrl, caption);
+    const item = await analyzeSingleImageWithRetry(imageUrl, caption);
     if (!item || item.type === 'none') continue;
 
-    const fecha = normalizeDateInput(item.fecha || '');
-    if (item.type === 'panel' && fecha) fechasPanel.push(fecha);
-    if (item.type === 'bajado' && fecha) fechasBajado.push(fecha);
-
     if (item.type === 'panel') {
-      const dep = parseNumber(item.depositos);
-      const ret = parseNumber(item.retiros);
+      const fechaRaw = item.fecha_texto || '';
+      if (fechaRaw) panelDatesRaw.push(fechaRaw);
+
+      const dep = parseNumber(item.depositos_texto);
+      const ret = parseNumber(item.retiros_texto);
       if (dep !== null || ret !== null) {
         panelItems.push({ depositos: dep ?? 0, retiros: ret ?? 0 });
       }
     } else if (item.type === 'bajado') {
-      const montoRaw = item.monto_texto || item.monto;
-      const monto = parseNumber(montoRaw);
+      const fechaRaw = item.fecha_texto || '';
+      const monto = parseNumber(item.monto_texto);
+      const idFallback = `${fechaRaw}|${item.monto_texto || ''}`;
+      const id = extractComprobanteId(item, idFallback);
+
       if (monto !== null) {
-        bajadoItems.push(monto);
+        bajadoItemsDetailed.push({ amount: monto, fechaRaw, id });
       } else {
         bajadoInvalidCount += 1;
       }
@@ -364,16 +435,10 @@ async function analyzeImages(imageUrls, caption = '') {
     panelData = { venta: ventaFinal, depositos: panelDeposit, retiros: panelRetiros };
   }
 
-  const bajadoTotal = bajadoItems.length
-    ? bajadoItems.reduce((sum, v) => sum + v, 0)
-    : null;
-
   return {
     panel: panelData,
-    bajadoTotal,
-    fechasPanel,
-    fechasBajado,
-    bajadoItemsCount: bajadoItems.length,
+    panelDatesRaw,
+    bajadoItemsDetailed,
     bajadoInvalidCount,
   };
 }
@@ -443,6 +508,7 @@ function startCierre(chatId) {
     bajadoReal: 0,
     gastos: 0,
     observaciones: '',
+    seenComprobanteIds: new Set(),
   });
   bot.sendMessage(
     chatId,
@@ -616,6 +682,38 @@ async function handleCierreFlow(chatId, text) {
   return false;
 }
 
+function validateBajadoItems(items, cierreFecha, seenSet) {
+  let total = 0;
+  const duplicates = [];
+
+  for (const item of items) {
+    if (!item.fechaRaw) {
+      return { error: 'missing_date' };
+    }
+    const candidates = getDateCandidates(item.fechaRaw);
+    if (!candidates.includes(cierreFecha)) {
+      return { error: 'date_mismatch' };
+    }
+
+    if (item.id) {
+      if (seenSet.has(item.id)) {
+        duplicates.push(item.id);
+        continue;
+      }
+      seenSet.add(item.id);
+    }
+
+    total += item.amount;
+  }
+
+  return { total, duplicates };
+}
+
+function panelDatesMatch(panelDatesRaw, cierreFecha) {
+  if (!panelDatesRaw.length) return true;
+  return panelDatesRaw.some((raw) => getDateCandidates(raw).includes(cierreFecha));
+}
+
 function enqueueBatch(chatId, item) {
   if (!batchQueue.has(chatId)) {
     batchQueue.set(chatId, { texts: [], images: [], timer: null });
@@ -650,7 +748,16 @@ async function processBatch(chatId) {
   }
 
   if (session && imageData) {
-    const fechasBajado = imageData.fechasBajado || [];
+    if (!panelDatesMatch(imageData.panelDatesRaw, session.fecha)) {
+      bot.sendMessage(
+        chatId,
+        sanitizeTelegramText(
+          `⚠️ La fecha del panel no coincide con el cierre (${session.fecha}). Enviá panel del día correcto.`
+        )
+      );
+      return;
+    }
+
     if (imageData.bajadoInvalidCount > 0) {
       bot.sendMessage(
         chatId,
@@ -658,16 +765,21 @@ async function processBatch(chatId) {
       );
       return;
     }
-    if (imageData.bajadoItemsCount > 0) {
-      if (fechasBajado.length !== imageData.bajadoItemsCount) {
+
+    if (imageData.bajadoItemsDetailed.length > 0) {
+      const result = validateBajadoItems(
+        imageData.bajadoItemsDetailed,
+        session.fecha,
+        session.seenComprobanteIds
+      );
+      if (result.error === 'missing_date') {
         bot.sendMessage(
           chatId,
           sanitizeTelegramText('⚠️ No pude leer la fecha de uno o más comprobantes. Reenviá las fotos.')
         );
         return;
       }
-      const mismatch = fechasBajado.some((f) => f !== session.fecha);
-      if (mismatch) {
+      if (result.error === 'date_mismatch') {
         bot.sendMessage(
           chatId,
           sanitizeTelegramText(
@@ -676,6 +788,13 @@ async function processBatch(chatId) {
         );
         return;
       }
+      if (result.duplicates.length) {
+        bot.sendMessage(
+          chatId,
+          sanitizeTelegramText('⚠️ Hay comprobantes repetidos (mismo ID). Se ignoraron duplicados.')
+        );
+      }
+      imageData.bajadoTotal = result.total;
     }
   }
 
