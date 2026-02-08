@@ -1098,7 +1098,7 @@ function validateBajadoItems(items, cierreFecha, seenSet) {
 
 function panelDatesMatch(panelDatesRaw, cierreFecha) {
   if (!panelDatesRaw.length) return true;
-  return panelDatesMatch = panelDatesRaw.some((raw) => getDateCandidates(raw).includes(cierreFecha));
+  return panelDatesRaw.some((raw) => getDateCandidates(raw).includes(cierreFecha));
 }
 
 function enqueueBatch(chatId, item) {
@@ -1127,6 +1127,11 @@ async function processBatch(chatId) {
 
   const session = cierreSessions.get(chatId);
 
+  if (/hacer cierre/i.test(combinedText) && !session) {
+    startCierre(chatId);
+    return;
+  }
+
   if (!session) {
     if (isHelpQuestion(combinedText)) {
       bot.sendMessage(chatId, sanitizeTelegramText(helpMessage()));
@@ -1134,11 +1139,6 @@ async function processBatch(chatId) {
     }
     const answered = await handleResumenQuery(chatId, combinedText);
     if (answered) return;
-  }
-
-  if (/hacer cierre/i.test(combinedText) && !session) {
-    startCierre(chatId);
-    return;
   }
 
   let text = combinedText.replace(/hacer cierre/i, '').trim();
