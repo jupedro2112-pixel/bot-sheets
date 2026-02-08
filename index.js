@@ -76,6 +76,9 @@ const METRICS = ['VENTA', 'DEPOSITOS', 'RETIROS', 'COMISION', 'NETO'];
 
 const cierreSessions = new Map();
 
+const resumenMemory = new Map();
+const MAX_HISTORY = 5;
+
 const BATCH_WINDOW_MS = 5000;
 const batchQueue = new Map();
 
@@ -663,7 +666,18 @@ async function getResumenData() {
     });
 }
 
-async function interpretResumenQuestion(question) {
+function getResumenHistory(chatId) {
+  return resumenMemory.get(chatId) || [];
+}
+
+function addResumenHistory(chatId, role, content) {
+  const history = resumenMemory.get(chatId) || [];
+  history.push({ role, content });
+  const trimmed = history.slice(-MAX_HISTORY);
+  resumenMemory.set(chatId, trimmed);
+}
+
+async function interpretResumenQuestion(question, history) {
   const systemPrompt = `
 Sos un parser de preguntas sobre "RESUMEN DIARIO".
 Devolvé SOLO JSON con este formato:
@@ -684,13 +698,18 @@ Si no hay fechas, dejar vacío.
 `;
 
   const allowedColumns = RESUMEN_COLUMNS.join(', ');
+  const historyText = history.map((m) => `${m.role}: ${m.content}`).join('\n');
+
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     temperature: 0,
     max_tokens: 200,
     messages: [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: `Columnas válidas: ${allowedColumns}\nPregunta: ${question}` },
+      {
+        role: 'user',
+        content: `Columnas válidas: ${allowedColumns}\nHistorial:\n${historyText}\nPregunta: ${question}`,
+      },
     ],
   });
 
@@ -698,6 +717,32 @@ Si no hay fechas, dejar vacío.
   const parsed = safeJsonExtract(raw);
   if (!parsed || !parsed.action || !Array.isArray(parsed.columns)) return null;
   return parsed;
+}
+
+async function formatResumenResponse(question, resultText, history) {
+  const systemPrompt = `
+Sos un asistente de atención sobre RESUMEN DIARIO.
+Respondé en español, formal, serio y muy breve (máx. 3 líneas).
+Usá 0 a 2 emojis. No inventes datos.
+Si falta información, pedí aclaración.
+`;
+
+  const historyText = history.map((m) => `${m.role}: ${m.content}`).join('\n');
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    max_tokens: 120,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      {
+        role: 'user',
+        content: `Historial:\n${historyText}\nPregunta: ${question}\nResultado calculado:\n${resultText}`,
+      },
+    ],
+  });
+
+  return response.choices[0].message.content?.trim() || resultText;
 }
 
 function dateInRange(dateStr, from, to) {
@@ -794,8 +839,15 @@ async function handleResumenQuery(chatId, text) {
     return true;
   }
 
-  const parsed = await interpretResumenQuestion(question);
-  if (!parsed) return false;
+  const history = getResumenHistory(chatId);
+  const parsed = await interpretResumenQuestion(question, history);
+  if (!parsed) {
+    bot.sendMessage(
+      chatId,
+      sanitizeTelegramText('⚠️ No pude interpretar la consulta. Indicá fecha y equipo.')
+    );
+    return true;
+  }
 
   const date = normalizeDateInput(parsed.date || '');
   const dateFrom = normalizeDateInput(parsed.date_from || '');
@@ -814,8 +866,12 @@ async function handleResumenQuery(chatId, text) {
     return dateInRange(fecha, dateFrom, dateTo);
   });
 
-  const answer = buildQueryResult(parsed.action, columns, rows);
-  bot.sendMessage(chatId, sanitizeTelegramText(answer));
+  const rawAnswer = buildQueryResult(parsed.action, columns, rows);
+  const finalAnswer = await formatResumenResponse(question, rawAnswer, history);
+
+  bot.sendMessage(chatId, sanitizeTelegramText(finalAnswer));
+  addResumenHistory(chatId, 'user', question);
+  addResumenHistory(chatId, 'assistant', finalAnswer);
   return true;
 }
 
