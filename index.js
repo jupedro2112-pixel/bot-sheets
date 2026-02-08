@@ -78,6 +78,7 @@ const cierreSessions = new Map();
 
 const resumenMemory = new Map();
 const MAX_HISTORY = 5;
+const MAX_QA_ROWS = 200;
 
 const BATCH_WINDOW_MS = 5000;
 const batchQueue = new Map();
@@ -688,13 +689,6 @@ Devolvé SOLO JSON con este formato:
   "date_from": "dd/mm/aaaa" | "",
   "date_to": "dd/mm/aaaa" | ""
 }
-
-Usá SOLO columnas válidas del listado.
-Si el usuario pide ventas por equipo, convertí a la columna correcta (EJ: ARGENTUM_VENTA).
-Si pide TOTAL, usá TOTAL_NETO o TOTAL_A_BAJAR según corresponda.
-Si pregunta por un día puntual, pone "date".
-Si pregunta por rango, usa date_from/date_to.
-Si no hay fechas, dejar vacío.
 `;
 
   const allowedColumns = RESUMEN_COLUMNS.join(', ');
@@ -743,6 +737,34 @@ Si falta información, pedí aclaración.
   });
 
   return response.choices[0].message.content?.trim() || resultText;
+}
+
+async function answerResumenWithLLM(question, data, history) {
+  const systemPrompt = `
+Sos un asistente que responde preguntas SOLO usando la hoja "RESUMEN DIARIO".
+Respondé formal, serio y breve (máx. 3 líneas).
+Si no hay datos suficientes, decilo con claridad.
+No inventes datos.
+`;
+
+  const historyText = history.map((m) => `${m.role}: ${m.content}`).join('\n');
+  const dataSlice = data.slice(-MAX_QA_ROWS);
+  const dataJson = JSON.stringify(dataSlice);
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    max_tokens: 180,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      {
+        role: 'user',
+        content: `Historial:\n${historyText}\nDatos:\n${dataJson}\nPregunta: ${question}`,
+      },
+    ],
+  });
+
+  return response.choices[0].message.content?.trim() || 'No hay datos disponibles.';
 }
 
 function dateInRange(dateStr, from, to) {
@@ -841,11 +863,12 @@ async function handleResumenQuery(chatId, text) {
 
   const history = getResumenHistory(chatId);
   const parsed = await interpretResumenQuestion(question, history);
+
   if (!parsed) {
-    bot.sendMessage(
-      chatId,
-      sanitizeTelegramText('⚠️ No pude interpretar la consulta. Indicá fecha y equipo.')
-    );
+    const fallback = await answerResumenWithLLM(question, data, history);
+    bot.sendMessage(chatId, sanitizeTelegramText(fallback));
+    addResumenHistory(chatId, 'user', question);
+    addResumenHistory(chatId, 'assistant', fallback);
     return true;
   }
 
@@ -855,7 +878,10 @@ async function handleResumenQuery(chatId, text) {
   const columns = parsed.columns.filter((c) => RESUMEN_COLUMNS.includes(c));
 
   if (!columns.length) {
-    bot.sendMessage(chatId, sanitizeTelegramText('⚠️ No encontré columnas válidas en tu pregunta.'));
+    const fallback = await answerResumenWithLLM(question, data, history);
+    bot.sendMessage(chatId, sanitizeTelegramText(fallback));
+    addResumenHistory(chatId, 'user', question);
+    addResumenHistory(chatId, 'assistant', fallback);
     return true;
   }
 
@@ -1072,7 +1098,7 @@ function validateBajadoItems(items, cierreFecha, seenSet) {
 
 function panelDatesMatch(panelDatesRaw, cierreFecha) {
   if (!panelDatesRaw.length) return true;
-  return panelDatesRaw.some((raw) => getDateCandidates(raw).includes(cierreFecha));
+  return panelDatesMatch = panelDatesRaw.some((raw) => getDateCandidates(raw).includes(cierreFecha));
 }
 
 function enqueueBatch(chatId, item) {
@@ -1099,7 +1125,9 @@ async function processBatch(chatId) {
   const deleteHandled = await handleDeleteFecha(chatId, combinedText);
   if (deleteHandled) return;
 
-  if (!cierreSessions.has(chatId)) {
+  const session = cierreSessions.get(chatId);
+
+  if (!session) {
     if (isHelpQuestion(combinedText)) {
       bot.sendMessage(chatId, sanitizeTelegramText(helpMessage()));
       return;
@@ -1108,12 +1136,12 @@ async function processBatch(chatId) {
     if (answered) return;
   }
 
-  if (/hacer cierre/i.test(combinedText) && !cierreSessions.has(chatId)) {
+  if (/hacer cierre/i.test(combinedText) && !session) {
     startCierre(chatId);
+    return;
   }
 
   let text = combinedText.replace(/hacer cierre/i, '').trim();
-  const session = cierreSessions.get(chatId);
 
   let imageData = null;
   if (imageUrls.length) {
