@@ -713,12 +713,31 @@ function dateInRange(dateStr, from, to) {
   return true;
 }
 
+function emojiForColumn(col) {
+  if (col.includes('VENTA')) return '💵';
+  if (col.includes('DEPOSITOS')) return '🏦';
+  if (col.includes('RETIROS')) return '💸';
+  if (col.includes('COMISION')) return '🧾';
+  if (col.includes('NETO')) return '✅';
+  if (col.includes('GASTOS')) return '🧯';
+  if (col.includes('PRESTAMOS')) return '🤝';
+  if (col.includes('BAJADO')) return '⬇️';
+  return '📌';
+}
+
+function formatResumenLine(col, value) {
+  return `${emojiForColumn(col)} ${col}: ${formatNumberES(value)}`;
+}
+
 function buildQueryResult(action, columns, rows) {
-  if (!rows.length) return 'No hay datos para ese criterio.';
+  if (!rows.length) return '⚠️ No hay datos para ese criterio.';
 
   if (action === 'list') {
     const lines = rows.map((row) => {
-      const parts = columns.map((col) => `${col}: ${formatNumberES(parseNumber(row[col])) || row[col]}`);
+      const parts = columns.map((col) => {
+        const val = parseNumber(row[col]) ?? 0;
+        return formatResumenLine(col, val);
+      });
       return `📅 ${row.FECHA} | ${parts.join(' | ')}`;
     });
     return lines.join('\n');
@@ -732,19 +751,37 @@ function buildQueryResult(action, columns, rows) {
   if (action === 'avg') {
     const lines = columns.map((col) => {
       const avg = totals[col] / rows.length;
-      return `${col}: ${formatNumberES(avg)}`;
+      return `📊 ${col}: ${formatNumberES(avg)}`;
     });
     return lines.join('\n');
   }
 
   if (action === 'value' && rows.length === 1 && columns.length === 1) {
-    const value = rows[0][columns[0]];
-    const parsed = parseNumber(value);
-    return `${columns[0]}: ${parsed !== null ? formatNumberES(parsed) : value}`;
+    const value = parseNumber(rows[0][columns[0]]) ?? 0;
+    return `📌 ${columns[0]} (${rows[0].FECHA}): ${formatNumberES(value)}`;
   }
 
-  const lines = columns.map((col) => `${col}: ${formatNumberES(totals[col])}`);
-  return lines.join('\n');
+  const lines = columns.map((col) => formatResumenLine(col, totals[col]));
+  return `📊 Resumen:\n${lines.join('\n')}`;
+}
+
+function isHelpQuestion(text) {
+  return /ayuda|comandos|cómo|como|instrucciones|hacer cierre|cerrar día|cerrar dia/i.test(text);
+}
+
+function helpMessage() {
+  return [
+    '🧭 Comandos disponibles:',
+    '• "hacer cierre" → inicia cierre diario',
+    '• "volver" / "atrás" → vuelve al paso anterior',
+    '• "cancelar cierre" → cancela el cierre',
+    '• "borrar fecha DD/MM/AAAA" → borra esa fecha del RESUMEN',
+    '',
+    '📊 Preguntas sobre RESUMEN DIARIO:',
+    '• "venta de ARGENTUM el 01/02/2026"',
+    '• "sumar ventas del 01/02/2026 al 05/02/2026"',
+    '• "total neto del 03/02/2026"',
+  ].join('\n');
 }
 
 async function handleResumenQuery(chatId, text) {
@@ -1007,6 +1044,10 @@ async function processBatch(chatId) {
   if (deleteHandled) return;
 
   if (!cierreSessions.has(chatId)) {
+    if (isHelpQuestion(combinedText)) {
+      bot.sendMessage(chatId, sanitizeTelegramText(helpMessage()));
+      return;
+    }
     const answered = await handleResumenQuery(chatId, combinedText);
     if (answered) return;
   }
@@ -1095,10 +1136,6 @@ async function processBatch(chatId) {
     }
     const handled = await handleCierreFlow(chatId, text || '');
     if (handled) return;
-  }
-
-  if (!session && combinedText) {
-    bot.sendMessage(chatId, sanitizeTelegramText('Usá "hacer cierre" para iniciar el cierre diario paso a paso.'));
   }
 }
 
