@@ -358,29 +358,10 @@ async function getPendingFromPreviousDay(dateStr) {
   return 0;
 }
 
-function pickMostCommon(values) {
-  const filtered = values.filter((v) => v !== null && v !== undefined && String(v).trim() !== '');
-  if (!filtered.length) return '';
-  const counts = new Map();
-  filtered.forEach((v) => {
-    const key = String(v);
-    counts.set(key, (counts.get(key) || 0) + 1);
-  });
-  let best = filtered[0];
-  let bestCount = 0;
-  for (const [key, count] of counts.entries()) {
-    if (count > bestCount) {
-      best = key;
-      bestCount = count;
-    }
-  }
-  return best;
-}
-
 async function analyzeSingleImage(imageUrl, caption = '') {
   const systemPrompt = `
 Extraé datos financieros de UNA SOLA imagen.
-Devolvé SOLO JSON:
+Respondé SOLO JSON:
 {"type":"panel","depositos_texto":"","retiros_texto":"","fecha_texto":""}
 o
 {"type":"bajado","monto_texto":"","fecha_texto":"","comprobante_id":"","coelsa_id":"","operacion_id":""}
@@ -389,9 +370,10 @@ o
 o
 {"type":"none"}
 
-La fecha puede venir como "01/02/2026" o "2026-02-01".
-Si hay más de un monto, devolvé el monto total transferido.
-Para CBU devolvé el saldo total visible en la cuenta.
+Reglas:
+- Si falta un dato, dejalo vacío ("").
+- Si hay más de un monto, devolvé el monto total transferido.
+- Para CBU devolvé el saldo total visible en la cuenta.
 `;
 
   const response = await openai.chat.completions.create({
@@ -416,47 +398,6 @@ Para CBU devolvé el saldo total visible en la cuenta.
   return parsed;
 }
 
-async function analyzeSingleImageWithConsensus(imageUrl, caption = '') {
-  const attempts = [];
-  for (let i = 0; i < 3; i += 1) {
-    const item = await analyzeSingleImage(imageUrl, caption);
-    if (item) attempts.push(item);
-  }
-  if (!attempts.length) return null;
-
-  const type = pickMostCommon(attempts.map((a) => a.type));
-  const sameType = attempts.filter((a) => a.type === type);
-
-  if (type === 'panel') {
-    return {
-      type,
-      depositos_texto: pickMostCommon(sameType.map((a) => a.depositos_texto)),
-      retiros_texto: pickMostCommon(sameType.map((a) => a.retiros_texto)),
-      fecha_texto: pickMostCommon(sameType.map((a) => a.fecha_texto)),
-    };
-  }
-
-  if (type === 'bajado') {
-    return {
-      type,
-      monto_texto: pickMostCommon(sameType.map((a) => a.monto_texto)),
-      fecha_texto: pickMostCommon(sameType.map((a) => a.fecha_texto)),
-      comprobante_id: pickMostCommon(sameType.map((a) => a.comprobante_id)),
-      coelsa_id: pickMostCommon(sameType.map((a) => a.coelsa_id)),
-      operacion_id: pickMostCommon(sameType.map((a) => a.operacion_id)),
-    };
-  }
-
-  if (type === 'cbu') {
-    return {
-      type,
-      monto_texto: pickMostCommon(sameType.map((a) => a.monto_texto)),
-    };
-  }
-
-  return { type: 'none' };
-}
-
 async function analyzeImages(imageUrls, caption = '') {
   if (!imageUrls.length) return null;
 
@@ -468,7 +409,7 @@ async function analyzeImages(imageUrls, caption = '') {
   let cbuInvalidCount = 0;
 
   for (const imageUrl of imageUrls) {
-    const item = await analyzeSingleImageWithConsensus(imageUrl, caption);
+    const item = await analyzeSingleImage(imageUrl, caption);
     if (!item || item.type === 'none') continue;
 
     if (item.type === 'panel') {
@@ -486,7 +427,7 @@ async function analyzeImages(imageUrls, caption = '') {
       const idFallback = `${fechaRaw}|${item.monto_texto || ''}`;
       const id = extractComprobanteId(item, idFallback);
 
-      if (monto !== null) {
+      if (monto !== null && fechaRaw) {
         bajadoItemsDetailed.push({ amount: monto, fechaRaw, id });
       } else {
         bajadoInvalidCount += 1;
@@ -1239,14 +1180,14 @@ async function processBatch(chatId) {
   if (session && imageData) {
     if (session.step === 'cbu') {
       if (imageData.cbuInvalidCount > 0) {
-        bot.sendMessage(
+        await bot.sendMessage(
           chatId,
-          sanitizeTelegramText('⚠️ No pude leer uno o más saldos de CBU. Reenviá las fotos.')
+          sanitizeTelegramText('⚠️ No pude leer el saldo CBU en una o más fotos.')
         );
         return;
       }
       if (imageData.cbuTotal !== null) {
-        bot.sendMessage(
+        await bot.sendMessage(
           chatId,
           sanitizeTelegramText(`ℹ️ Total CBU 00:00 (suma bancos): ${formatNumberES(imageData.cbuTotal)}`)
         );
@@ -1254,75 +1195,65 @@ async function processBatch(chatId) {
       }
     }
 
-    if (!panelDatesMatch(imageData.panelDatesRaw, session.fecha)) {
-      bot.sendMessage(
+    if (session.step === 'equipo' && imageData.panel) {
+      await bot.sendMessage(
         chatId,
         sanitizeTelegramText(
-          `⚠️ La fecha del panel no coincide con el cierre (${session.fecha}). Enviá panel del día correcto.`
+          `📌 Panel detectado: Depósitos ${formatNumberES(imageData.panel.depositos)} | Retiros ${formatNumberES(imageData.panel.retiros)} | Venta ${formatNumberES(imageData.panel.venta)}`
         )
       );
-      return;
+      text = `${imageData.panel.depositos}, ${imageData.panel.retiros}`;
     }
 
-    if (imageData.bajadoInvalidCount > 0) {
-      bot.sendMessage(
-        chatId,
-        sanitizeTelegramText('⚠️ No pude leer uno o más montos de comprobantes. Reenviá las fotos.')
-      );
-      return;
-    }
-
-    if (imageData.bajadoItemsDetailed.length > 0) {
+    if (session.step === 'bajado' && imageData.bajadoItemsDetailed.length > 0) {
       const result = validateBajadoItems(
         imageData.bajadoItemsDetailed,
         session.fecha,
         session.seenComprobanteIds
       );
       if (result.error === 'missing_date') {
-        bot.sendMessage(
+        await bot.sendMessage(
           chatId,
-          sanitizeTelegramText('⚠️ No pude leer la fecha de uno o más comprobantes. Reenviá las fotos.')
+          sanitizeTelegramText('⚠️ No se encontró la fecha en uno o más comprobantes.')
         );
         return;
       }
       if (result.error === 'date_mismatch') {
-        bot.sendMessage(
+        await bot.sendMessage(
           chatId,
           sanitizeTelegramText(
-            `⚠️ La fecha de los comprobantes no coincide con el cierre (${session.fecha}). Enviá solo comprobantes de ese día.`
+            `⚠️ La fecha de los comprobantes no coincide con el cierre (${session.fecha}).`
           )
         );
         return;
       }
-      if (result.duplicates.length) {
-        bot.sendMessage(
-          chatId,
-          sanitizeTelegramText(`⚠️ Comprobantes repetidos: ${result.duplicates.join(', ')}`)
-        );
-      }
-      imageData.bajadoTotal = result.total;
+      await bot.sendMessage(
+        chatId,
+        sanitizeTelegramText(`✅ Total comprobantes: ${formatNumberES(result.total)}`)
+      );
+      text = `${result.total}`;
+    }
+
+    if (!panelDatesMatch(imageData.panelDatesRaw, session.fecha)) {
+      await bot.sendMessage(
+        chatId,
+        sanitizeTelegramText(
+          `⚠️ La fecha del panel no coincide con el cierre (${session.fecha}).`
+        )
+      );
+      return;
+    }
+
+    if (imageData.bajadoInvalidCount > 0) {
+      await bot.sendMessage(
+        chatId,
+        sanitizeTelegramText('⚠️ No se encontró el monto en uno o más comprobantes.')
+      );
+      return;
     }
   }
 
   if (session) {
-    if (!text) {
-      if (session.step === 'equipo' && imageData?.panel) {
-        bot.sendMessage(
-          chatId,
-          sanitizeTelegramText(
-            `📌 Panel detectado: Depósitos ${formatNumberES(imageData.panel.depositos)} | Retiros ${formatNumberES(imageData.panel.retiros)} | Venta ${formatNumberES(imageData.panel.venta)}`
-          )
-        );
-        text = `${imageData.panel.depositos}, ${imageData.panel.retiros}`;
-      }
-      if (session.step === 'bajado' && imageData?.bajadoTotal !== null) {
-        bot.sendMessage(
-          chatId,
-          sanitizeTelegramText(`✅ Total comprobantes: ${formatNumberES(imageData.bajadoTotal)}`)
-        );
-        text = `${imageData.bajadoTotal}`;
-      }
-    }
     const handled = await handleCierreFlow(chatId, text || '');
     if (handled) return;
   }
