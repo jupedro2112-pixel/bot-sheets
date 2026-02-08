@@ -504,6 +504,7 @@ function summarizeCierre(summary) {
   lines.push(`🏦 Total a Bajar: ${formatNumberES(summary.totalABajar)}`);
   lines.push(`✅ Bajado Real: ${formatNumberES(summary.bajadoReal)}`);
   lines.push(`⚠️ Pendiente a Bajar: ${formatNumberES(summary.pendienteABajar)}`);
+  lines.push(`ℹ️ CBU 00:00: ${formatNumberES(summary.cbu00)}`);
   lines.push(`🤝 Préstamos Pedidos: ${formatNumberES(summary.prestamosPedidos)}`);
   lines.push(`🤝 Préstamos Devueltos: ${formatNumberES(summary.prestamosDevueltos)}`);
   lines.push(`📌 Préstamos Pendientes: ${formatNumberES(summary.prestamosPendientes)}`);
@@ -545,6 +546,13 @@ function promptStep(chatId, session) {
     bot.sendMessage(chatId, sanitizeTelegramText('🏦 ¿Cuánto se bajó real hoy? Podés mandar comprobantes.'));
     return;
   }
+  if (session.step === 'cbu') {
+    bot.sendMessage(
+      chatId,
+      sanitizeTelegramText('ℹ️ ¿Cuánto hay en CBU a las 00:00? (del día siguiente)')
+    );
+    return;
+  }
   if (session.step === 'observaciones') {
     bot.sendMessage(chatId, sanitizeTelegramText('📝 Observaciones del día (o "sin obs").'));
     return;
@@ -565,6 +573,12 @@ function goBack(chatId, session) {
   }
 
   if (session.step === 'observaciones') {
+    session.step = 'cbu';
+    promptStep(chatId, session);
+    return true;
+  }
+
+  if (session.step === 'cbu') {
     session.step = 'bajado';
     promptStep(chatId, session);
     return true;
@@ -619,6 +633,7 @@ function startCierre(chatId) {
     prestamosDevueltos: 0,
     bajadoReal: 0,
     gastos: 0,
+    cbu00: null,
     observaciones: '',
     seenComprobanteIds: new Set(),
     pendingSummary: null,
@@ -833,7 +848,7 @@ function buildQueryResult(action, columns, rows) {
 }
 
 function isHelpQuestion(text) {
-  return /ayuda|comandos|cómo|como|instrucciones|hacer cierre|cerrar día|cerrar dia/i.test(text);
+  return /ayuda|comandos|cómo|como|instrucciones|cerrar día|cerrar dia/i.test(text);
 }
 
 function helpMessage() {
@@ -984,6 +999,18 @@ async function handleCierreFlow(chatId, text) {
       return true;
     }
     session.bajadoReal = bajado;
+    session.step = 'cbu';
+    promptStep(chatId, session);
+    return true;
+  }
+
+  if (session.step === 'cbu') {
+    const cbu = parseNumber(text);
+    if (cbu === null) {
+      bot.sendMessage(chatId, sanitizeTelegramText('⚠️ Enviá un número válido para CBU 00:00.'));
+      return true;
+    }
+    session.cbu00 = cbu;
     session.step = 'observaciones';
     promptStep(chatId, session);
     return true;
@@ -1029,6 +1056,7 @@ async function handleCierreFlow(chatId, text) {
       observaciones: session.observaciones,
       alertas,
       pendienteAnterior,
+      cbu00: session.cbu00,
     };
 
     const resumenTexto = summarizeCierre(session.pendingSummary);
@@ -1127,7 +1155,7 @@ async function processBatch(chatId) {
 
   const session = cierreSessions.get(chatId);
 
-  if (/hacer cierre/i.test(combinedText) && !session) {
+  if (/^hacer cierre$/i.test(combinedText) && !session) {
     startCierre(chatId);
     return;
   }
