@@ -358,6 +358,25 @@ async function getPendingFromPreviousDay(dateStr) {
   return 0;
 }
 
+function pickMostCommon(values) {
+  const filtered = values.filter((v) => v !== null && v !== undefined && String(v).trim() !== '');
+  if (!filtered.length) return '';
+  const counts = new Map();
+  filtered.forEach((v) => {
+    const key = String(v);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  });
+  let best = filtered[0];
+  let bestCount = 0;
+  for (const [key, count] of counts.entries()) {
+    if (count > bestCount) {
+      best = key;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
 async function analyzeSingleImage(imageUrl, caption = '') {
   const systemPrompt = `
 Extraé datos financieros de UNA SOLA imagen.
@@ -366,10 +385,13 @@ Devolvé SOLO JSON:
 o
 {"type":"bajado","monto_texto":"","fecha_texto":"","comprobante_id":"","coelsa_id":"","operacion_id":""}
 o
+{"type":"cbu","monto_texto":""}
+o
 {"type":"none"}
 
 La fecha puede venir como "01/02/2026" o "2026-02-01".
 Si hay más de un monto, devolvé el monto total transferido.
+Para CBU devolvé el saldo total visible en la cuenta.
 `;
 
   const response = await openai.chat.completions.create({
@@ -394,20 +416,45 @@ Si hay más de un monto, devolvé el monto total transferido.
   return parsed;
 }
 
-async function analyzeSingleImageWithRetry(imageUrl, caption = '') {
-  const first = await analyzeSingleImage(imageUrl, caption);
-  if (!first) return null;
+async function analyzeSingleImageWithConsensus(imageUrl, caption = '') {
+  const attempts = [];
+  for (let i = 0; i < 3; i += 1) {
+    const item = await analyzeSingleImage(imageUrl, caption);
+    if (item) attempts.push(item);
+  }
+  if (!attempts.length) return null;
 
-  const needsRetry =
-    (first.type === 'bajado' && (!first.monto_texto || !first.fecha_texto)) ||
-    (first.type === 'panel' && (!first.depositos_texto || !first.retiros_texto));
+  const type = pickMostCommon(attempts.map((a) => a.type));
+  const sameType = attempts.filter((a) => a.type === type);
 
-  if (!needsRetry) return first;
+  if (type === 'panel') {
+    return {
+      type,
+      depositos_texto: pickMostCommon(sameType.map((a) => a.depositos_texto)),
+      retiros_texto: pickMostCommon(sameType.map((a) => a.retiros_texto)),
+      fecha_texto: pickMostCommon(sameType.map((a) => a.fecha_texto)),
+    };
+  }
 
-  const second = await analyzeSingleImage(imageUrl, caption);
-  if (!second) return first;
+  if (type === 'bajado') {
+    return {
+      type,
+      monto_texto: pickMostCommon(sameType.map((a) => a.monto_texto)),
+      fecha_texto: pickMostCommon(sameType.map((a) => a.fecha_texto)),
+      comprobante_id: pickMostCommon(sameType.map((a) => a.comprobante_id)),
+      coelsa_id: pickMostCommon(sameType.map((a) => a.coelsa_id)),
+      operacion_id: pickMostCommon(sameType.map((a) => a.operacion_id)),
+    };
+  }
 
-  return second;
+  if (type === 'cbu') {
+    return {
+      type,
+      monto_texto: pickMostCommon(sameType.map((a) => a.monto_texto)),
+    };
+  }
+
+  return { type: 'none' };
 }
 
 async function analyzeImages(imageUrls, caption = '') {
@@ -416,10 +463,12 @@ async function analyzeImages(imageUrls, caption = '') {
   const panelDatesRaw = [];
   const bajadoItemsDetailed = [];
   const panelItems = [];
+  const cbuItems = [];
   let bajadoInvalidCount = 0;
+  let cbuInvalidCount = 0;
 
   for (const imageUrl of imageUrls) {
-    const item = await analyzeSingleImageWithRetry(imageUrl, caption);
+    const item = await analyzeSingleImageWithConsensus(imageUrl, caption);
     if (!item || item.type === 'none') continue;
 
     if (item.type === 'panel') {
@@ -442,6 +491,13 @@ async function analyzeImages(imageUrls, caption = '') {
       } else {
         bajadoInvalidCount += 1;
       }
+    } else if (item.type === 'cbu') {
+      const monto = parseNumber(item.monto_texto);
+      if (monto !== null) {
+        cbuItems.push(monto);
+      } else {
+        cbuInvalidCount += 1;
+      }
     }
   }
 
@@ -453,11 +509,15 @@ async function analyzeImages(imageUrls, caption = '') {
     panelData = { venta: ventaFinal, depositos: panelDeposit, retiros: panelRetiros };
   }
 
+  const cbuTotal = cbuItems.length ? cbuItems.reduce((sum, v) => sum + v, 0) : null;
+
   return {
     panel: panelData,
     panelDatesRaw,
     bajadoItemsDetailed,
     bajadoInvalidCount,
+    cbuTotal,
+    cbuInvalidCount,
   };
 }
 
@@ -549,7 +609,7 @@ function promptStep(chatId, session) {
   if (session.step === 'cbu') {
     bot.sendMessage(
       chatId,
-      sanitizeTelegramText('ℹ️ ¿Cuánto hay en CBU a las 00:00? (del día siguiente)')
+      sanitizeTelegramText('ℹ️ ¿Cuánto hay en CBU a las 00:00? Podés mandar fotos de bancos.')
     );
     return;
   }
@@ -1177,6 +1237,23 @@ async function processBatch(chatId) {
   }
 
   if (session && imageData) {
+    if (session.step === 'cbu') {
+      if (imageData.cbuInvalidCount > 0) {
+        bot.sendMessage(
+          chatId,
+          sanitizeTelegramText('⚠️ No pude leer uno o más saldos de CBU. Reenviá las fotos.')
+        );
+        return;
+      }
+      if (imageData.cbuTotal !== null) {
+        bot.sendMessage(
+          chatId,
+          sanitizeTelegramText(`ℹ️ Total CBU 00:00 (suma bancos): ${formatNumberES(imageData.cbuTotal)}`)
+        );
+        text = `${imageData.cbuTotal}`;
+      }
+    }
+
     if (!panelDatesMatch(imageData.panelDatesRaw, session.fecha)) {
       bot.sendMessage(
         chatId,
