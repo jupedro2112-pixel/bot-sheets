@@ -920,7 +920,7 @@ async function processBatch(chatId) {
       if (result.duplicates.length) {
         bot.sendMessage(
           chatId,
-          sanitizeTelegramText('⚠️ Hay comprobantes repetidos (mismo ID). Se ignoraron duplicados.')
+          sanitizeTelegramText(`⚠️ Comprobantes repetidos: ${result.duplicates.join(', ')}`)
         );
       }
       imageData.bajadoTotal = result.total;
@@ -930,9 +930,19 @@ async function processBatch(chatId) {
   if (session) {
     if (!text) {
       if (session.step === 'equipo' && imageData?.panel) {
+        bot.sendMessage(
+          chatId,
+          sanitizeTelegramText(
+            `📌 Panel detectado: Depósitos ${formatNumberES(imageData.panel.depositos)} | Retiros ${formatNumberES(imageData.panel.retiros)} | Venta ${formatNumberES(imageData.panel.venta)}`
+          )
+        );
         text = `${imageData.panel.depositos}, ${imageData.panel.retiros}`;
       }
       if (session.step === 'bajado' && imageData?.bajadoTotal !== null) {
+        bot.sendMessage(
+          chatId,
+          sanitizeTelegramText(`✅ Total comprobantes: ${formatNumberES(imageData.bajadoTotal)}`)
+        );
         text = `${imageData.bajadoTotal}`;
       }
     }
