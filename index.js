@@ -268,6 +268,18 @@ async function getSheetValues(sheetName, range) {
   return res.data.values || [];
 }
 
+async function clearResumenRow(rowIndex) {
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+  const lastColumnLetter = columnIndexToLetter(RESUMEN_COLUMNS.length - 1);
+  const range = `${RESUMEN_SHEET}!A${rowIndex}:${lastColumnLetter}${rowIndex}`;
+
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: SHEET_ID,
+    range,
+  });
+}
+
 async function writeResumenRow(rowIndex, values) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
@@ -497,6 +509,100 @@ function summarizeCierre(summary) {
   return lines.join('\n');
 }
 
+function promptStep(chatId, session) {
+  if (session.step === 'fecha') {
+    bot.sendMessage(chatId, sanitizeTelegramText('📅 Pasame la fecha (dd/mm/aaaa o yyyy-mm-dd).'));
+    return;
+  }
+  if (session.step === 'equipo') {
+    const team = TEAM_ORDER[session.teamIndex];
+    bot.sendMessage(
+      chatId,
+      sanitizeTelegramText(
+        `🎯 ${team.label}: enviame Depósitos y Retiros (o foto del panel). La venta se calcula como Depósitos - Retiros.`
+      )
+    );
+    return;
+  }
+  if (session.step === 'prestamos') {
+    bot.sendMessage(
+      chatId,
+      sanitizeTelegramText('🤝 Préstamos: enviá pedidos y devueltos. Ej: 9000000, 3000000')
+    );
+    return;
+  }
+  if (session.step === 'gastos') {
+    bot.sendMessage(chatId, sanitizeTelegramText('💸 Gastos del día (sin devolución).'));
+    return;
+  }
+  if (session.step === 'bajado') {
+    bot.sendMessage(chatId, sanitizeTelegramText('🏦 ¿Cuánto se bajó real hoy? Podés mandar comprobantes.'));
+    return;
+  }
+  if (session.step === 'observaciones') {
+    bot.sendMessage(chatId, sanitizeTelegramText('📝 Observaciones del día (o "sin obs").'));
+    return;
+  }
+  if (session.step === 'confirmar') {
+    bot.sendMessage(chatId, sanitizeTelegramText('¿Está todo correcto? (si/no)'));
+  }
+}
+
+function goBack(chatId, session) {
+  session.pendingSummary = null;
+
+  if (session.step === 'confirmar') {
+    session.step = 'observaciones';
+    session.observaciones = '';
+    promptStep(chatId, session);
+    return true;
+  }
+
+  if (session.step === 'observaciones') {
+    session.step = 'bajado';
+    promptStep(chatId, session);
+    return true;
+  }
+
+  if (session.step === 'bajado') {
+    session.step = 'gastos';
+    promptStep(chatId, session);
+    return true;
+  }
+
+  if (session.step === 'gastos') {
+    session.step = 'prestamos';
+    promptStep(chatId, session);
+    return true;
+  }
+
+  if (session.step === 'prestamos') {
+    session.step = 'equipo';
+    session.teamIndex = TEAM_ORDER.length - 1;
+    const team = TEAM_ORDER[session.teamIndex];
+    delete session.teams[team.key];
+    promptStep(chatId, session);
+    return true;
+  }
+
+  if (session.step === 'equipo') {
+    if (session.teamIndex > 0) {
+      session.teamIndex -= 1;
+      const team = TEAM_ORDER[session.teamIndex];
+      delete session.teams[team.key];
+      promptStep(chatId, session);
+      return true;
+    }
+    session.step = 'fecha';
+    session.fecha = '';
+    promptStep(chatId, session);
+    return true;
+  }
+
+  bot.sendMessage(chatId, sanitizeTelegramText('⚠️ No hay un paso anterior.'));
+  return true;
+}
+
 function startCierre(chatId) {
   cierreSessions.set(chatId, {
     step: 'fecha',
@@ -509,11 +615,29 @@ function startCierre(chatId) {
     gastos: 0,
     observaciones: '',
     seenComprobanteIds: new Set(),
+    pendingSummary: null,
   });
+  promptStep(chatId, cierreSessions.get(chatId));
+}
+
+async function handleDeleteFecha(chatId, text) {
+  if (!/borrar fecha/i.test(text)) return false;
+  const date = extractDateFromText(text);
+  if (!date) {
+    bot.sendMessage(chatId, sanitizeTelegramText('📅 Pasame la fecha a borrar (dd/mm/aaaa).'));
+    return true;
+  }
+  const rowIndex = await findResumenRowByDate(date);
+  if (!rowIndex) {
+    bot.sendMessage(chatId, sanitizeTelegramText('⚠️ No encontré esa fecha en RESUMEN DIARIO.'));
+    return true;
+  }
+  await clearResumenRow(rowIndex);
   bot.sendMessage(
     chatId,
-    sanitizeTelegramText('📅 Iniciamos cierre. Pasame la fecha (dd/mm/aaaa o yyyy-mm-dd).')
+    sanitizeTelegramText(`✅ Fecha ${date} borrada de RESUMEN DIARIO (fila ${rowIndex}).`)
   );
+  return true;
 }
 
 async function handleCierreFlow(chatId, text) {
@@ -526,6 +650,10 @@ async function handleCierreFlow(chatId, text) {
     return true;
   }
 
+  if (/^(volver|atr[aá]s)$/i.test(text)) {
+    return goBack(chatId, session);
+  }
+
   if (session.step === 'fecha') {
     const date = extractDateFromText(text);
     if (!date) {
@@ -534,13 +662,7 @@ async function handleCierreFlow(chatId, text) {
     }
     session.fecha = date;
     session.step = 'equipo';
-    const team = TEAM_ORDER[session.teamIndex];
-    bot.sendMessage(
-      chatId,
-      sanitizeTelegramText(
-        `🎯 ${team.label}: enviame Depósitos y Retiros (o foto del panel). La venta se calcula como Depósitos - Retiros. Ej: 5000000, 4000000`
-      )
-    );
+    promptStep(chatId, session);
     return true;
   }
 
@@ -560,21 +682,12 @@ async function handleCierreFlow(chatId, text) {
 
     session.teamIndex += 1;
     if (session.teamIndex < TEAM_ORDER.length) {
-      const next = TEAM_ORDER[session.teamIndex];
-      bot.sendMessage(
-        chatId,
-        sanitizeTelegramText(
-          `🎯 ${next.label}: enviame Depósitos y Retiros (o foto del panel). La venta se calcula como Depósitos - Retiros.`
-        )
-      );
+      promptStep(chatId, session);
       return true;
     }
 
     session.step = 'prestamos';
-    bot.sendMessage(
-      chatId,
-      sanitizeTelegramText('🤝 Préstamos: enviá pedidos y devueltos. Ej: 9000000, 3000000')
-    );
+    promptStep(chatId, session);
     return true;
   }
 
@@ -587,7 +700,7 @@ async function handleCierreFlow(chatId, text) {
     session.prestamosPedidos = numbers[0];
     session.prestamosDevueltos = numbers[1];
     session.step = 'gastos';
-    bot.sendMessage(chatId, sanitizeTelegramText('💸 Gastos del día (sin devolución).'));
+    promptStep(chatId, session);
     return true;
   }
 
@@ -599,7 +712,7 @@ async function handleCierreFlow(chatId, text) {
     }
     session.gastos = gastos;
     session.step = 'bajado';
-    bot.sendMessage(chatId, sanitizeTelegramText('🏦 ¿Cuánto se bajó real hoy? Podés mandar comprobantes.'));
+    promptStep(chatId, session);
     return true;
   }
 
@@ -611,7 +724,7 @@ async function handleCierreFlow(chatId, text) {
     }
     session.bajadoReal = bajado;
     session.step = 'observaciones';
-    bot.sendMessage(chatId, sanitizeTelegramText('📝 Observaciones del día (o "sin obs").'));
+    promptStep(chatId, session);
     return true;
   }
 
@@ -626,18 +739,10 @@ async function handleCierreFlow(chatId, text) {
     const prestamosPendientes = Math.round(session.prestamosPedidos - session.prestamosDevueltos);
 
     const alertas = [];
-    if (pendienteABajar > 0) {
-      alertas.push('Falta bajar dinero respecto al total.');
-    }
-    if (pendienteABajar < 0) {
-      alertas.push('Se bajó más dinero del total a bajar.');
-    }
-    if (prestamosPendientes !== 0) {
-      alertas.push('Hay préstamos pendientes de devolución.');
-    }
-    if (totalNeto < 0) {
-      alertas.push('Total neto negativo: revisar balances por equipo.');
-    }
+    if (pendienteABajar > 0) alertas.push('Falta bajar dinero respecto al total.');
+    if (pendienteABajar < 0) alertas.push('Se bajó más dinero del total a bajar.');
+    if (prestamosPendientes !== 0) alertas.push('Hay préstamos pendientes de devolución.');
+    if (totalNeto < 0) alertas.push('Total neto negativo: revisar balances por equipo.');
 
     const minTeam = TEAM_ORDER.reduce((min, team) => {
       const t = session.teams[team.key];
@@ -649,7 +754,7 @@ async function handleCierreFlow(chatId, text) {
       alertas.push(`Revisar equipo con neto más negativo: ${minTeam.key} (${minTeam.neto}).`);
     }
 
-    const summary = {
+    session.pendingSummary = {
       fecha: session.fecha,
       teams: session.teams,
       totalNeto,
@@ -665,17 +770,38 @@ async function handleCierreFlow(chatId, text) {
       pendienteAnterior,
     };
 
-    const rowIndex = await getNextResumenRow(summary.fecha);
-    const rowValues = buildResumenValues(summary);
-    await writeResumenRow(rowIndex, rowValues);
-
-    const resumenTexto = summarizeCierre(summary);
+    const resumenTexto = summarizeCierre(session.pendingSummary);
     bot.sendMessage(
       chatId,
-      sanitizeTelegramText(`✅ Cierre guardado en RESUMEN DIARIO (fila ${rowIndex}).\n\n${resumenTexto}`)
+      sanitizeTelegramText(`${resumenTexto}\n\n¿Está todo correcto? (si/no)`)
     );
+    session.step = 'confirmar';
+    return true;
+  }
 
-    cierreSessions.delete(chatId);
+  if (session.step === 'confirmar') {
+    if (/^si$/i.test(text)) {
+      const summary = session.pendingSummary;
+      const rowIndex = await getNextResumenRow(summary.fecha);
+      const rowValues = buildResumenValues(summary);
+      await writeResumenRow(rowIndex, rowValues);
+
+      bot.sendMessage(
+        chatId,
+        sanitizeTelegramText(`✅ Cierre guardado en RESUMEN DIARIO (fila ${rowIndex}).`)
+      );
+      cierreSessions.delete(chatId);
+      return true;
+    }
+
+    if (/^no$/i.test(text)) {
+      cierreSessions.delete(chatId);
+      bot.sendMessage(chatId, sanitizeTelegramText('❌ Cierre descartado. Empezamos de nuevo.'));
+      startCierre(chatId);
+      return true;
+    }
+
+    bot.sendMessage(chatId, sanitizeTelegramText('Respondé con "si" o "no".'));
     return true;
   }
 
@@ -734,6 +860,9 @@ async function processBatch(chatId) {
 
   const combinedText = batch.texts.join('\n').trim();
   const imageUrls = batch.images;
+
+  const deleteHandled = await handleDeleteFecha(chatId, combinedText);
+  if (deleteHandled) return;
 
   if (/hacer cierre/i.test(combinedText) && !cierreSessions.has(chatId)) {
     startCierre(chatId);
