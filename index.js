@@ -72,6 +72,8 @@ const TEAM_ORDER = [
   { key: 'ATOMIC', label: 'ATOMIC' },
 ];
 
+const METRICS = ['VENTA', 'DEPOSITOS', 'RETIROS', 'COMISION', 'NETO'];
+
 const cierreSessions = new Map();
 
 const BATCH_WINDOW_MS = 5000;
@@ -227,9 +229,9 @@ function extractDateFromText(text) {
   return '';
 }
 
-function normalizeId(value) {
+function normalizeIdExact(value) {
   if (!value) return '';
-  return String(value).replace(/\s+/g, '').toLowerCase();
+  return String(value).trim();
 }
 
 function extractComprobanteId(item, fallback) {
@@ -240,9 +242,9 @@ function extractComprobanteId(item, fallback) {
     item.id ||
     item.referencia ||
     '';
-  const normalized = normalizeId(id);
+  const normalized = normalizeIdExact(id);
   if (normalized) return normalized;
-  return fallback ? normalizeId(fallback) : '';
+  return fallback ? normalizeIdExact(fallback) : '';
 }
 
 function columnIndexToLetter(index) {
@@ -640,6 +642,146 @@ async function handleDeleteFecha(chatId, text) {
   return true;
 }
 
+async function getResumenData() {
+  const lastColumnLetter = columnIndexToLetter(RESUMEN_COLUMNS.length - 1);
+  const rows = await getSheetValues(RESUMEN_SHEET, `A:${lastColumnLetter}`);
+  if (!rows.length) return [];
+
+  const header = rows[0].map((h) => h?.toString().trim() || '');
+  const dataRows = rows.slice(1);
+  const indexMap = RESUMEN_COLUMNS.map((col) => header.indexOf(col));
+
+  return dataRows
+    .filter((row) => row && row.length)
+    .map((row) => {
+      const record = {};
+      RESUMEN_COLUMNS.forEach((col, idx) => {
+        const pos = indexMap[idx];
+        record[col] = pos >= 0 ? row[pos] ?? '' : '';
+      });
+      return record;
+    });
+}
+
+async function interpretResumenQuestion(question) {
+  const systemPrompt = `
+Sos un parser de preguntas sobre "RESUMEN DIARIO".
+Devolvé SOLO JSON con este formato:
+{
+  "action": "sum" | "value" | "avg" | "list",
+  "columns": ["COLUMNA1", "COLUMNA2"],
+  "date": "dd/mm/aaaa" | "",
+  "date_from": "dd/mm/aaaa" | "",
+  "date_to": "dd/mm/aaaa" | ""
+}
+
+Usá SOLO columnas válidas del listado.
+Si el usuario pide ventas por equipo, convertí a la columna correcta (EJ: ARGENTUM_VENTA).
+Si pide TOTAL, usá TOTAL_NETO o TOTAL_A_BAJAR según corresponda.
+Si pregunta por un día puntual, pone "date".
+Si pregunta por rango, usa date_from/date_to.
+Si no hay fechas, dejar vacío.
+`;
+
+  const allowedColumns = RESUMEN_COLUMNS.join(', ');
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0,
+    max_tokens: 200,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: `Columnas válidas: ${allowedColumns}\nPregunta: ${question}` },
+    ],
+  });
+
+  const raw = response.choices[0].message.content || '';
+  const parsed = safeJsonExtract(raw);
+  if (!parsed || !parsed.action || !Array.isArray(parsed.columns)) return null;
+  return parsed;
+}
+
+function dateInRange(dateStr, from, to) {
+  if (!dateStr) return false;
+  if (!from && !to) return true;
+  const toKey = (d) => {
+    const [dd, mm, yyyy] = d.split('/');
+    return `${yyyy}${mm}${dd}`;
+  };
+  const target = toKey(dateStr);
+  if (from && target < toKey(from)) return false;
+  if (to && target > toKey(to)) return false;
+  return true;
+}
+
+function buildQueryResult(action, columns, rows) {
+  if (!rows.length) return 'No hay datos para ese criterio.';
+
+  if (action === 'list') {
+    const lines = rows.map((row) => {
+      const parts = columns.map((col) => `${col}: ${formatNumberES(parseNumber(row[col])) || row[col]}`);
+      return `📅 ${row.FECHA} | ${parts.join(' | ')}`;
+    });
+    return lines.join('\n');
+  }
+
+  const totals = {};
+  columns.forEach((col) => {
+    totals[col] = rows.reduce((sum, row) => sum + (parseNumber(row[col]) ?? 0), 0);
+  });
+
+  if (action === 'avg') {
+    const lines = columns.map((col) => {
+      const avg = totals[col] / rows.length;
+      return `${col}: ${formatNumberES(avg)}`;
+    });
+    return lines.join('\n');
+  }
+
+  if (action === 'value' && rows.length === 1 && columns.length === 1) {
+    const value = rows[0][columns[0]];
+    const parsed = parseNumber(value);
+    return `${columns[0]}: ${parsed !== null ? formatNumberES(parsed) : value}`;
+  }
+
+  const lines = columns.map((col) => `${col}: ${formatNumberES(totals[col])}`);
+  return lines.join('\n');
+}
+
+async function handleResumenQuery(chatId, text) {
+  const question = text.trim();
+  if (!question) return false;
+
+  const data = await getResumenData();
+  if (!data.length) {
+    bot.sendMessage(chatId, sanitizeTelegramText('⚠️ No hay datos en RESUMEN DIARIO.'));
+    return true;
+  }
+
+  const parsed = await interpretResumenQuestion(question);
+  if (!parsed) return false;
+
+  const date = normalizeDateInput(parsed.date || '');
+  const dateFrom = normalizeDateInput(parsed.date_from || '');
+  const dateTo = normalizeDateInput(parsed.date_to || '');
+  const columns = parsed.columns.filter((c) => RESUMEN_COLUMNS.includes(c));
+
+  if (!columns.length) {
+    bot.sendMessage(chatId, sanitizeTelegramText('⚠️ No encontré columnas válidas en tu pregunta.'));
+    return true;
+  }
+
+  const rows = data.filter((row) => {
+    const fecha = normalizeDateInput(row.FECHA || '');
+    if (!fecha) return false;
+    if (date && fecha !== date) return false;
+    return dateInRange(fecha, dateFrom, dateTo);
+  });
+
+  const answer = buildQueryResult(parsed.action, columns, rows);
+  bot.sendMessage(chatId, sanitizeTelegramText(answer));
+  return true;
+}
+
 async function handleCierreFlow(chatId, text) {
   const session = cierreSessions.get(chatId);
   if (!session) return false;
@@ -863,6 +1005,11 @@ async function processBatch(chatId) {
 
   const deleteHandled = await handleDeleteFecha(chatId, combinedText);
   if (deleteHandled) return;
+
+  if (!cierreSessions.has(chatId)) {
+    const answered = await handleResumenQuery(chatId, combinedText);
+    if (answered) return;
+  }
 
   if (/hacer cierre/i.test(combinedText) && !cierreSessions.has(chatId)) {
     startCierre(chatId);
