@@ -17,11 +17,9 @@ const auth = new google.auth.GoogleAuth({
 });
 
 const RESUMEN_SHEET = 'RESUMEN DIARIO';
-
 const METRICS = ['VENTA', 'DEPOSITOS', 'RETIROS', 'COMISION', 'NETO'];
 
 const cierreSessions = new Map();
-
 const resumenMemory = new Map();
 const MAX_HISTORY = 5;
 const MAX_QA_ROWS = 200;
@@ -811,7 +809,7 @@ function emojiForColumn(col) {
   if (col.includes('COMISION')) return '🧾';
   if (col.includes('NETO')) return '✅';
   if (col.includes('GASTOS')) return '🧯';
-  if (col.includes('PRESTAMOS')) return '���';
+  if (col.includes('PRESTAMOS')) return '🤝';
   if (col.includes('BAJADO')) return '⬇️';
   return '📌';
 }
