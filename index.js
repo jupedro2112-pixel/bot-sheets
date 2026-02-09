@@ -176,11 +176,7 @@ function normalizeDateValue(value) {
   if (!value) return '';
   const raw = String(value).trim();
   if (!raw) return '';
-  return raw
-    .replace(/\./g, '/')
-    .replace(/-/g, '/')
-    .replace(/\s+/g, '')
-    .toLowerCase();
+  return raw.replace(/\./g, '/').replace(/-/g, '/').replace(/\s+/g, '').toLowerCase();
 }
 
 function normalizeDateInput(value) {
@@ -874,7 +870,7 @@ async function handleResumenQuery(config, chatId, text) {
 
   const data = await getResumenData(config);
   if (!data.length) {
-    bot.sendMessage(chatId, sanitizeTelegramText('⚠️ No hay datos en RESUMEN DIARIO.'));
+    bot.sendMessage(chatId, sanitizeTelegramText('���️ No hay datos en RESUMEN DIARIO.'));
     return true;
   }
 
@@ -1149,9 +1145,7 @@ function enqueueBatch(chatId, item) {
 
 async function processBatch(chatId) {
   const config = getConfigByChatId(chatId);
-  if (!config) {
-    return;
-  }
+  if (!config) return;
 
   const batch = batchQueue.get(chatId);
   if (!batch) return;
@@ -1166,7 +1160,16 @@ async function processBatch(chatId) {
 
   const session = cierreSessions.get(chatId);
 
-  if (combinedText.toLowerCase() === config.cierreCommand && !session) {
+  const lowerText = combinedText.toLowerCase();
+  if (/^hacer cierre\b/i.test(lowerText) && lowerText !== config.cierreCommand) {
+    bot.sendMessage(
+      chatId,
+      sanitizeTelegramText(`⚠️ Usá "${config.cierreCommand}" para iniciar el cierre.`)
+    );
+    return;
+  }
+
+  if (lowerText === config.cierreCommand && !session) {
     startCierre(config, chatId);
     return;
   }
