@@ -60,6 +60,7 @@ const RESUMEN_COLUMNS = [
   'PRESTAMOS_DEVUELTOS',
   'PRESTAMOS_PENDIENTES',
   'GASTOS',
+  'CBU_A_LAS_00_00',
   'OBSERVACIONES',
 ];
 
@@ -485,6 +486,7 @@ function buildResumenValues(summary) {
   push(formatNumberES(summary.prestamosDevueltos));
   push(formatNumberES(summary.prestamosPendientes));
   push(formatNumberES(summary.gastos));
+  push(formatNumberES(summary.cbu00));
   push(summary.observaciones);
 
   return values;
