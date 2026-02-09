@@ -16,62 +16,7 @@ const auth = new google.auth.GoogleAuth({
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
-const SHEET_ID = process.env.SHEET_ID;
-
 const RESUMEN_SHEET = 'RESUMEN DIARIO';
-
-const RESUMEN_COLUMNS = [
-  'FECHA',
-  'ARGENTUM_VENTA',
-  'ARGENTUM_DEPOSITOS',
-  'ARGENTUM_RETIROS',
-  'ARGENTUM_COMISION',
-  'ARGENTUM_NETO',
-  'IGNITE_ROYAL_VENTA',
-  'IGNITE_ROYAL_DEPOSITOS',
-  'IGNITE_ROYAL_RETIROS',
-  'IGNITE_ROYAL_COMISION',
-  'IGNITE_ROYAL_NETO',
-  'IGNITE_TRIBET_VENTA',
-  'IGNITE_TRIBET_DEPOSITOS',
-  'IGNITE_TRIBET_RETIROS',
-  'IGNITE_TRIBET_COMISION',
-  'IGNITE_TRIBET_NETO',
-  'TIGER_VENTA',
-  'TIGER_DEPOSITOS',
-  'TIGER_RETIROS',
-  'TIGER_COMISION',
-  'TIGER_NETO',
-  'MARSHALL_VENTA',
-  'MARSHALL_DEPOSITOS',
-  'MARSHALL_RETIROS',
-  'MARSHALL_COMISION',
-  'MARSHALL_NETO',
-  'ATOMIC_VENTA',
-  'ATOMIC_DEPOSITOS',
-  'ATOMIC_RETIROS',
-  'ATOMIC_COMISION',
-  'ATOMIC_NETO',
-  'TOTAL_NETO',
-  'TOTAL_A_BAJAR',
-  'BAJADO_REAL',
-  'PENDIENTE_A_BAJAR',
-  'PRESTAMOS_PEDIDOS',
-  'PRESTAMOS_DEVUELTOS',
-  'PRESTAMOS_PENDIENTES',
-  'GASTOS',
-  'CBU_A_LAS_00_00',
-  'OBSERVACIONES',
-];
-
-const TEAM_ORDER = [
-  { key: 'ARGENTUM', label: 'ARGENTUM' },
-  { key: 'IGNITE_ROYAL', label: 'IGNITE/ROYAL' },
-  { key: 'IGNITE_TRIBET', label: 'IGNITE/TRIBET' },
-  { key: 'TIGER', label: 'TIGER' },
-  { key: 'MARSHALL', label: 'MARSHALL' },
-  { key: 'ATOMIC', label: 'ATOMIC' },
-];
 
 const METRICS = ['VENTA', 'DEPOSITOS', 'RETIROS', 'COMISION', 'NETO'];
 
@@ -86,6 +31,66 @@ const batchQueue = new Map();
 
 const MAX_INT_DIGITS = 12;
 const MAX_VALUE = 1e12;
+
+const GROUP_CONFIGS = {
+  publicidad: {
+    chatId: '-5207612016',
+    sheetId: '1ehEzABG63Qdr7uqK0YY9I0OE1bhSAgHmrTqZl3kcNFA',
+    cierreCommand: 'hacer cierre publicidad',
+    teamOrder: [
+      { key: 'ARGENTUM', label: 'ARGENTUM' },
+      { key: 'IGNITE_ROYAL', label: 'IGNITE/ROYAL' },
+      { key: 'IGNITE_TRIBET', label: 'IGNITE/TRIBET' },
+      { key: 'TIGER', label: 'TIGER' },
+      { key: 'MARSHALL', label: 'MARSHALL' },
+      { key: 'ATOMIC', label: 'ATOMIC' },
+    ],
+  },
+  ganamos: {
+    chatId: '-5226617614',
+    sheetId: '16IBVRk-VCS5cKdjmIes5OoeXbir357-r0WnR0dqyJGI',
+    cierreCommand: 'hacer cierre ganamos',
+    teamOrder: [
+      { key: 'LUXOR', label: 'LUXOR' },
+      { key: 'CIRCA', label: 'CIRCA' },
+      { key: 'BIG', label: 'BIG' },
+      { key: 'ZYRO', label: 'ZYRO' },
+      { key: 'MET', label: 'MET' },
+      { key: 'METAWIN', label: 'METAWIN' },
+    ],
+  },
+};
+
+function buildResumenColumns(teamOrder) {
+  const teamColumns = teamOrder.flatMap((team) =>
+    METRICS.map((metric) => `${team.key}_${metric}`)
+  );
+  return [
+    'FECHA',
+    ...teamColumns,
+    'TOTAL_NETO',
+    'TOTAL_A_BAJAR',
+    'BAJADO_REAL',
+    'PENDIENTE_A_BAJAR',
+    'PRESTAMOS_PEDIDOS',
+    'PRESTAMOS_DEVUELTOS',
+    'PRESTAMOS_PENDIENTES',
+    'GASTOS',
+    'CBU_A_LAS_00_00',
+    'OBSERVACIONES',
+  ];
+}
+
+const CONFIG_BY_CHAT = new Map(
+  Object.values(GROUP_CONFIGS).map((config) => [
+    config.chatId,
+    { ...config, resumenColumns: buildResumenColumns(config.teamOrder) },
+  ])
+);
+
+function getConfigByChatId(chatId) {
+  return CONFIG_BY_CHAT.get(String(chatId)) || null;
+}
 
 function sanitizeTelegramText(text) {
   return text.replace(/[*#]/g, '');
@@ -263,39 +268,39 @@ function columnIndexToLetter(index) {
   return letter;
 }
 
-async function getSheetValues(sheetName, range) {
+async function getSheetValues(config, sheetName, range) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
 
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: config.sheetId,
     range: `${sheetName}!${range}`,
   });
 
   return res.data.values || [];
 }
 
-async function clearResumenRow(rowIndex) {
+async function clearResumenRow(config, rowIndex) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
-  const lastColumnLetter = columnIndexToLetter(RESUMEN_COLUMNS.length - 1);
+  const lastColumnLetter = columnIndexToLetter(config.resumenColumns.length - 1);
   const range = `${RESUMEN_SHEET}!A${rowIndex}:${lastColumnLetter}${rowIndex}`;
 
   await sheets.spreadsheets.values.clear({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: config.sheetId,
     range,
   });
 }
 
-async function writeResumenRow(rowIndex, values) {
+async function writeResumenRow(config, rowIndex, values) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
 
-  const lastColumnLetter = columnIndexToLetter(RESUMEN_COLUMNS.length - 1);
+  const lastColumnLetter = columnIndexToLetter(config.resumenColumns.length - 1);
   const range = `${RESUMEN_SHEET}!A${rowIndex}:${lastColumnLetter}${rowIndex}`;
 
   await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: config.sheetId,
     range,
     valueInputOption: 'USER_ENTERED',
     requestBody: {
@@ -304,8 +309,8 @@ async function writeResumenRow(rowIndex, values) {
   });
 }
 
-async function findResumenRowByDate(dateStr) {
-  const columnA = await getSheetValues(RESUMEN_SHEET, 'A:A');
+async function findResumenRowByDate(config, dateStr) {
+  const columnA = await getSheetValues(config, RESUMEN_SHEET, 'A:A');
   const target = normalizeDateInput(dateStr);
 
   for (let i = 1; i < columnA.length; i += 1) {
@@ -319,11 +324,11 @@ async function findResumenRowByDate(dateStr) {
   return null;
 }
 
-async function getNextResumenRow(dateStr) {
-  const existing = await findResumenRowByDate(dateStr);
+async function getNextResumenRow(config, dateStr) {
+  const existing = await findResumenRowByDate(config, dateStr);
   if (existing) return existing;
 
-  const columnA = await getSheetValues(RESUMEN_SHEET, 'A:A');
+  const columnA = await getSheetValues(config, RESUMEN_SHEET, 'A:A');
   for (let i = columnA.length - 1; i >= 1; i -= 1) {
     if ((columnA[i]?.[0] || '').toString().trim() !== '') {
       return i + 2;
@@ -332,9 +337,9 @@ async function getNextResumenRow(dateStr) {
   return 2;
 }
 
-async function getPendingFromPreviousDay(dateStr) {
-  const dates = await getSheetValues(RESUMEN_SHEET, 'A:A');
-  const pendings = await getSheetValues(RESUMEN_SHEET, 'AI:AI');
+async function getPendingFromPreviousDay(config, dateStr) {
+  const dates = await getSheetValues(config, RESUMEN_SHEET, 'A:A');
+  const pendings = await getSheetValues(config, RESUMEN_SHEET, 'AI:AI');
   const target = normalizeDateInput(dateStr);
 
   let targetRow = -1;
@@ -463,13 +468,13 @@ async function analyzeImages(imageUrls, caption = '') {
   };
 }
 
-function buildResumenValues(summary) {
+function buildResumenValues(config, summary) {
   const values = [];
   const push = (val) => values.push(val ?? '');
 
   push(summary.fecha);
 
-  TEAM_ORDER.forEach((team) => {
+  config.teamOrder.forEach((team) => {
     const t = summary.teams[team.key];
     push(formatNumberES(t.venta));
     push(formatNumberES(t.depositos));
@@ -492,11 +497,11 @@ function buildResumenValues(summary) {
   return values;
 }
 
-function summarizeCierre(summary) {
+function summarizeCierre(config, summary) {
   const lines = [];
   lines.push(`📅 Fecha: ${summary.fecha}`);
   lines.push(`📌 Pendiente anterior: ${formatNumberES(summary.pendienteAnterior)}`);
-  TEAM_ORDER.forEach((team) => {
+  config.teamOrder.forEach((team) => {
     const t = summary.teams[team.key];
     lines.push(
       `🎯 ${team.label}: Venta ${formatNumberES(t.venta)} | Depósitos ${formatNumberES(t.depositos)} | Retiros ${formatNumberES(t.retiros)} | Comisión ${formatNumberES(t.comision)} | Neto ${formatNumberES(t.neto)}`
@@ -519,13 +524,13 @@ function summarizeCierre(summary) {
   return lines.join('\n');
 }
 
-function promptStep(chatId, session) {
+function promptStep(config, chatId, session) {
   if (session.step === 'fecha') {
     bot.sendMessage(chatId, sanitizeTelegramText('📅 Pasame la fecha (dd/mm/aaaa o yyyy-mm-dd).'));
     return;
   }
   if (session.step === 'equipo') {
-    const team = TEAM_ORDER[session.teamIndex];
+    const team = config.teamOrder[session.teamIndex];
     bot.sendMessage(
       chatId,
       sanitizeTelegramText(
@@ -565,60 +570,60 @@ function promptStep(chatId, session) {
   }
 }
 
-function goBack(chatId, session) {
+function goBack(config, chatId, session) {
   session.pendingSummary = null;
 
   if (session.step === 'confirmar') {
     session.step = 'observaciones';
     session.observaciones = '';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
   if (session.step === 'observaciones') {
     session.step = 'cbu';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
   if (session.step === 'cbu') {
     session.step = 'bajado';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
   if (session.step === 'bajado') {
     session.step = 'gastos';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
   if (session.step === 'gastos') {
     session.step = 'prestamos';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
   if (session.step === 'prestamos') {
     session.step = 'equipo';
-    session.teamIndex = TEAM_ORDER.length - 1;
-    const team = TEAM_ORDER[session.teamIndex];
+    session.teamIndex = config.teamOrder.length - 1;
+    const team = config.teamOrder[session.teamIndex];
     delete session.teams[team.key];
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
   if (session.step === 'equipo') {
     if (session.teamIndex > 0) {
       session.teamIndex -= 1;
-      const team = TEAM_ORDER[session.teamIndex];
+      const team = config.teamOrder[session.teamIndex];
       delete session.teams[team.key];
-      promptStep(chatId, session);
+      promptStep(config, chatId, session);
       return true;
     }
     session.step = 'fecha';
     session.fecha = '';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
@@ -626,7 +631,7 @@ function goBack(chatId, session) {
   return true;
 }
 
-function startCierre(chatId) {
+function startCierre(config, chatId) {
   cierreSessions.set(chatId, {
     step: 'fecha',
     teamIndex: 0,
@@ -640,23 +645,24 @@ function startCierre(chatId) {
     observaciones: '',
     seenComprobanteIds: new Set(),
     pendingSummary: null,
+    config,
   });
-  promptStep(chatId, cierreSessions.get(chatId));
+  promptStep(config, chatId, cierreSessions.get(chatId));
 }
 
-async function handleDeleteFecha(chatId, text) {
+async function handleDeleteFecha(config, chatId, text) {
   if (!/borrar fecha/i.test(text)) return false;
   const date = extractDateFromText(text);
   if (!date) {
     bot.sendMessage(chatId, sanitizeTelegramText('📅 Pasame la fecha a borrar (dd/mm/aaaa).'));
     return true;
   }
-  const rowIndex = await findResumenRowByDate(date);
+  const rowIndex = await findResumenRowByDate(config, date);
   if (!rowIndex) {
     bot.sendMessage(chatId, sanitizeTelegramText('⚠️ No encontré esa fecha en RESUMEN DIARIO.'));
     return true;
   }
-  await clearResumenRow(rowIndex);
+  await clearResumenRow(config, rowIndex);
   bot.sendMessage(
     chatId,
     sanitizeTelegramText(`✅ Fecha ${date} borrada de RESUMEN DIARIO (fila ${rowIndex}).`)
@@ -664,20 +670,20 @@ async function handleDeleteFecha(chatId, text) {
   return true;
 }
 
-async function getResumenData() {
-  const lastColumnLetter = columnIndexToLetter(RESUMEN_COLUMNS.length - 1);
-  const rows = await getSheetValues(RESUMEN_SHEET, `A:${lastColumnLetter}`);
+async function getResumenData(config) {
+  const lastColumnLetter = columnIndexToLetter(config.resumenColumns.length - 1);
+  const rows = await getSheetValues(config, RESUMEN_SHEET, `A:${lastColumnLetter}`);
   if (!rows.length) return [];
 
   const header = rows[0].map((h) => h?.toString().trim() || '');
   const dataRows = rows.slice(1);
-  const indexMap = RESUMEN_COLUMNS.map((col) => header.indexOf(col));
+  const indexMap = config.resumenColumns.map((col) => header.indexOf(col));
 
   return dataRows
     .filter((row) => row && row.length)
     .map((row) => {
       const record = {};
-      RESUMEN_COLUMNS.forEach((col, idx) => {
+      config.resumenColumns.forEach((col, idx) => {
         const pos = indexMap[idx];
         record[col] = pos >= 0 ? row[pos] ?? '' : '';
       });
@@ -696,7 +702,7 @@ function addResumenHistory(chatId, role, content) {
   resumenMemory.set(chatId, trimmed);
 }
 
-async function interpretResumenQuestion(question, history) {
+async function interpretResumenQuestion(config, question, history) {
   const systemPrompt = `
 Sos un parser de preguntas sobre "RESUMEN DIARIO".
 Devolvé SOLO JSON con este formato:
@@ -709,7 +715,7 @@ Devolvé SOLO JSON con este formato:
 }
 `;
 
-  const allowedColumns = RESUMEN_COLUMNS.join(', ');
+  const allowedColumns = config.resumenColumns.join(', ');
   const historyText = history.map((m) => `${m.role}: ${m.content}`).join('\n');
 
   const response = await openai.chat.completions.create({
@@ -805,7 +811,7 @@ function emojiForColumn(col) {
   if (col.includes('COMISION')) return '🧾';
   if (col.includes('NETO')) return '✅';
   if (col.includes('GASTOS')) return '🧯';
-  if (col.includes('PRESTAMOS')) return '🤝';
+  if (col.includes('PRESTAMOS')) return '���';
   if (col.includes('BAJADO')) return '⬇️';
   return '📌';
 }
@@ -854,33 +860,28 @@ function isHelpQuestion(text) {
   return /ayuda|comandos|cómo|como|instrucciones|cerrar día|cerrar dia/i.test(text);
 }
 
-function helpMessage() {
+function helpMessage(config) {
   return [
     '🧭 Comandos disponibles:',
-    '• "hacer cierre" → inicia cierre diario',
+    `• "${config.cierreCommand}" → inicia cierre diario`,
     '• "volver" / "atrás" → vuelve al paso anterior',
     '• "cancelar cierre" → cancela el cierre',
     '• "borrar fecha DD/MM/AAAA" → borra esa fecha del RESUMEN',
-    '',
-    '📊 Preguntas sobre RESUMEN DIARIO:',
-    '• "venta de ARGENTUM el 01/02/2026"',
-    '• "sumar ventas del 01/02/2026 al 05/02/2026"',
-    '• "total neto del 03/02/2026"',
   ].join('\n');
 }
 
-async function handleResumenQuery(chatId, text) {
+async function handleResumenQuery(config, chatId, text) {
   const question = text.trim();
   if (!question) return false;
 
-  const data = await getResumenData();
+  const data = await getResumenData(config);
   if (!data.length) {
     bot.sendMessage(chatId, sanitizeTelegramText('⚠️ No hay datos en RESUMEN DIARIO.'));
     return true;
   }
 
   const history = getResumenHistory(chatId);
-  const parsed = await interpretResumenQuestion(question, history);
+  const parsed = await interpretResumenQuestion(config, question, history);
 
   if (!parsed) {
     const fallback = await answerResumenWithLLM(question, data, history);
@@ -893,7 +894,7 @@ async function handleResumenQuery(chatId, text) {
   const date = normalizeDateInput(parsed.date || '');
   const dateFrom = normalizeDateInput(parsed.date_from || '');
   const dateTo = normalizeDateInput(parsed.date_to || '');
-  const columns = parsed.columns.filter((c) => RESUMEN_COLUMNS.includes(c));
+  const columns = parsed.columns.filter((c) => config.resumenColumns.includes(c));
 
   if (!columns.length) {
     const fallback = await answerResumenWithLLM(question, data, history);
@@ -922,6 +923,7 @@ async function handleResumenQuery(chatId, text) {
 async function handleCierreFlow(chatId, text) {
   const session = cierreSessions.get(chatId);
   if (!session) return false;
+  const config = session.config;
 
   if (/cancelar cierre/i.test(text)) {
     cierreSessions.delete(chatId);
@@ -930,7 +932,7 @@ async function handleCierreFlow(chatId, text) {
   }
 
   if (/^(volver|atr[aá]s)$/i.test(text)) {
-    return goBack(chatId, session);
+    return goBack(config, chatId, session);
   }
 
   if (session.step === 'fecha') {
@@ -941,7 +943,7 @@ async function handleCierreFlow(chatId, text) {
     }
     session.fecha = date;
     session.step = 'equipo';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
@@ -956,17 +958,17 @@ async function handleCierreFlow(chatId, text) {
     const comision = Math.round(depositos * 0.015);
     const neto = Math.round(venta - comision);
 
-    const team = TEAM_ORDER[session.teamIndex];
+    const team = config.teamOrder[session.teamIndex];
     session.teams[team.key] = { venta, depositos, retiros, comision, neto };
 
     session.teamIndex += 1;
-    if (session.teamIndex < TEAM_ORDER.length) {
-      promptStep(chatId, session);
+    if (session.teamIndex < config.teamOrder.length) {
+      promptStep(config, chatId, session);
       return true;
     }
 
     session.step = 'prestamos';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
@@ -979,7 +981,7 @@ async function handleCierreFlow(chatId, text) {
     session.prestamosPedidos = numbers[0];
     session.prestamosDevueltos = numbers[1];
     session.step = 'gastos';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
@@ -991,7 +993,7 @@ async function handleCierreFlow(chatId, text) {
     }
     session.gastos = gastos;
     session.step = 'bajado';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
@@ -1003,7 +1005,7 @@ async function handleCierreFlow(chatId, text) {
     }
     session.bajadoReal = bajado;
     session.step = 'cbu';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
@@ -1015,16 +1017,19 @@ async function handleCierreFlow(chatId, text) {
     }
     session.cbu00 = cbu;
     session.step = 'observaciones';
-    promptStep(chatId, session);
+    promptStep(config, chatId, session);
     return true;
   }
 
   if (session.step === 'observaciones') {
     session.observaciones = text.trim() || 'sin obs';
 
-    const totalNetoRaw = TEAM_ORDER.reduce((sum, team) => sum + session.teams[team.key].neto, 0);
+    const totalNetoRaw = config.teamOrder.reduce(
+      (sum, team) => sum + session.teams[team.key].neto,
+      0
+    );
     const totalNeto = Math.round(totalNetoRaw - session.gastos);
-    const pendienteAnterior = await getPendingFromPreviousDay(session.fecha);
+    const pendienteAnterior = await getPendingFromPreviousDay(config, session.fecha);
     const totalABajar = Math.round(totalNeto + pendienteAnterior);
     const pendienteABajar = Math.round(totalABajar - session.bajadoReal);
     const prestamosPendientes = Math.round(session.prestamosPedidos - session.prestamosDevueltos);
@@ -1035,7 +1040,7 @@ async function handleCierreFlow(chatId, text) {
     if (prestamosPendientes !== 0) alertas.push('Hay préstamos pendientes de devolución.');
     if (totalNeto < 0) alertas.push('Total neto negativo: revisar balances por equipo.');
 
-    const minTeam = TEAM_ORDER.reduce((min, team) => {
+    const minTeam = config.teamOrder.reduce((min, team) => {
       const t = session.teams[team.key];
       if (!min || t.neto < min.neto) return { key: team.label, neto: t.neto };
       return min;
@@ -1062,7 +1067,7 @@ async function handleCierreFlow(chatId, text) {
       cbu00: session.cbu00,
     };
 
-    const resumenTexto = summarizeCierre(session.pendingSummary);
+    const resumenTexto = summarizeCierre(config, session.pendingSummary);
     bot.sendMessage(
       chatId,
       sanitizeTelegramText(`${resumenTexto}\n\n¿Está todo correcto? (si/no)`)
@@ -1074,9 +1079,9 @@ async function handleCierreFlow(chatId, text) {
   if (session.step === 'confirmar') {
     if (/^si$/i.test(text)) {
       const summary = session.pendingSummary;
-      const rowIndex = await getNextResumenRow(summary.fecha);
-      const rowValues = buildResumenValues(summary);
-      await writeResumenRow(rowIndex, rowValues);
+      const rowIndex = await getNextResumenRow(config, summary.fecha);
+      const rowValues = buildResumenValues(config, summary);
+      await writeResumenRow(config, rowIndex, rowValues);
 
       bot.sendMessage(
         chatId,
@@ -1089,7 +1094,7 @@ async function handleCierreFlow(chatId, text) {
     if (/^no$/i.test(text)) {
       cierreSessions.delete(chatId);
       bot.sendMessage(chatId, sanitizeTelegramText('❌ Cierre descartado. Empezamos de nuevo.'));
-      startCierre(chatId);
+      startCierre(config, chatId);
       return true;
     }
 
@@ -1145,6 +1150,11 @@ function enqueueBatch(chatId, item) {
 }
 
 async function processBatch(chatId) {
+  const config = getConfigByChatId(chatId);
+  if (!config) {
+    return;
+  }
+
   const batch = batchQueue.get(chatId);
   if (!batch) return;
 
@@ -1153,26 +1163,26 @@ async function processBatch(chatId) {
   const combinedText = batch.texts.join('\n').trim();
   const imageUrls = batch.images;
 
-  const deleteHandled = await handleDeleteFecha(chatId, combinedText);
+  const deleteHandled = await handleDeleteFecha(config, chatId, combinedText);
   if (deleteHandled) return;
 
   const session = cierreSessions.get(chatId);
 
-  if (/^hacer cierre$/i.test(combinedText) && !session) {
-    startCierre(chatId);
+  if (combinedText.toLowerCase() === config.cierreCommand && !session) {
+    startCierre(config, chatId);
     return;
   }
 
   if (!session) {
     if (isHelpQuestion(combinedText)) {
-      bot.sendMessage(chatId, sanitizeTelegramText(helpMessage()));
+      bot.sendMessage(chatId, sanitizeTelegramText(helpMessage(config)));
       return;
     }
-    const answered = await handleResumenQuery(chatId, combinedText);
+    const answered = await handleResumenQuery(config, chatId, combinedText);
     if (answered) return;
   }
 
-  let text = combinedText.replace(/hacer cierre/i, '').trim();
+  let text = combinedText.replace(new RegExp(config.cierreCommand, 'i'), '').trim();
 
   let imageData = null;
   if (imageUrls.length) {
