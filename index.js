@@ -358,6 +358,33 @@ async function getPendingFromPreviousDay(config, dateStr) {
   return 0;
 }
 
+async function getPrestamosPendientesFromPreviousDay(config, dateStr) {
+  const dates = await getSheetValues(config, RESUMEN_SHEET, 'A:A');
+  const prestPendings = await getSheetValues(config, RESUMEN_SHEET, 'AL:AL');
+  const target = normalizeDateInput(dateStr);
+
+  let targetRow = -1;
+  for (let i = 1; i < dates.length; i += 1) {
+    const cellValue = dates[i]?.[0] ?? '';
+    if (normalizeDateInput(cellValue) === target) {
+      targetRow = i;
+      break;
+    }
+  }
+
+  if (targetRow > 1) {
+    const prev = prestPendings[targetRow - 1]?.[0];
+    return parseNumber(prev) ?? 0;
+  }
+
+  for (let i = prestPendings.length - 1; i >= 1; i -= 1) {
+    const val = parseNumber(prestPendings[i]?.[0]);
+    if (val !== null) return val;
+  }
+
+  return 0;
+}
+
 async function analyzeSingleImage(imageUrl, caption = '') {
   const systemPrompt = `
 Extraé datos financieros de UNA SOLA imagen.
@@ -870,7 +897,7 @@ async function handleResumenQuery(config, chatId, text) {
 
   const data = await getResumenData(config);
   if (!data.length) {
-    bot.sendMessage(chatId, sanitizeTelegramText('���️ No hay datos en RESUMEN DIARIO.'));
+    bot.sendMessage(chatId, sanitizeTelegramText('⚠️ No hay datos en RESUMEN DIARIO.'));
     return true;
   }
 
@@ -1026,7 +1053,14 @@ async function handleCierreFlow(chatId, text) {
     const pendienteAnterior = await getPendingFromPreviousDay(config, session.fecha);
     const totalABajar = Math.round(totalNeto + pendienteAnterior);
     const pendienteABajar = Math.round(totalABajar - session.bajadoReal);
-    const prestamosPendientes = Math.round(session.prestamosPedidos - session.prestamosDevueltos);
+
+    const prestamosPendientesPrev = await getPrestamosPendientesFromPreviousDay(
+      config,
+      session.fecha
+    );
+    const prestamosPendientes = Math.round(
+      prestamosPendientesPrev + session.prestamosPedidos - session.prestamosDevueltos
+    );
 
     const alertas = [];
     if (pendienteABajar > 0) alertas.push('Falta bajar dinero respecto al total.');
